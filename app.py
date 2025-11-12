@@ -95,8 +95,8 @@ def clean_json_response(content: str) -> str:
     
     content = content.strip()
     
-    # Remove markdown code block wrappers
-    if content.startswith("```
+    # Remove markdown code block wrappers (`````` or ``````)
+    if content.startswith('```
         # Remove opening ```json or ```
         content = re.sub(r'^```(?:json)?\s*\n?', '', content)
         # Remove closing ```
@@ -596,10 +596,7 @@ def process_file_streamlit(user_file_path: str,
                           text_area_placeholder,
                           model_service: str = MODEL_SERVICE_DEFAULT,
                           model_generic: str = MODEL_GENERIC_DEFAULT) -> Optional[str]:
-    """
-    Main worker. IMPORTANT: user_file_path is expected to be a local filesystem path (the UI saves the upload).
-    We no longer copy the file; we operate on the saved path directly.
-    """
+    """Main worker function."""
     # reinitialize globals
     global alpha_service, beta_service, gamma_service
     global alpha_speedtest, beta_speedtest, gamma_speedtest
@@ -619,30 +616,25 @@ def process_file_streamlit(user_file_path: str,
     extract_text = []
     avearge = {}
 
-    # ensure temp dir exists (UI created one, but be safe)
     os.makedirs(temp_dir, exist_ok=True)
     images_temp = os.path.join(temp_dir, "images")
     os.makedirs(images_temp, exist_ok=True)
 
-    # Use provided path directly (UI saved file to this path)
     local_template = user_file_path
     if not os.path.exists(local_template):
         log_append(text_area_placeholder, logs, f"[ERROR] Template not found: {local_template}")
         return None
 
-    # only support .xlsx now
     path_obj = Path(local_template)
     if path_obj.suffix.lower() != ".xlsx":
         log_append(text_area_placeholder, logs, "[ERROR] Unsupported file type (only .xlsx supported now).")
         return None
 
-    # extract images from workbook
     image_paths = extract_images_from_excel(local_template, images_temp, text_area_placeholder, logs)
     if not image_paths:
         log_append(text_area_placeholder, logs, "[ERROR] No images to process (workbook may not contain images).")
         return None
 
-    # group images by sector
     images_by_sector = {"alpha": [], "beta": [], "gamma": [], "voicetest": [], "unknown": []}
     for p in image_paths:
         sector = Path(p).stem.split("_")[0]
@@ -698,7 +690,6 @@ def process_file_streamlit(user_file_path: str,
                 elif res["image_type"] == "voice_call":
                     voice_test[image_name] = res.get("data", {})
 
-    # voicetest sector
     if images_by_sector["voicetest"]:
         log_append(text_area_placeholder, logs, "--- Processing sector: VOICETEST ---")
         for img in images_by_sector["voicetest"]:
@@ -706,7 +697,6 @@ def process_file_streamlit(user_file_path: str,
             if res and res.get("image_type") == "voice_call":
                 voice_test[Path(img).stem] = res.get("data", {})
 
-    # ---------------- Evaluation pass & Rule 2 ----------------
     log_append(text_area_placeholder, logs, "\n[LOG] Starting evaluation pass to refill missing/null fields.")
 
     retried_service_sectors = set()
@@ -722,7 +712,6 @@ def process_file_streamlit(user_file_path: str,
                 return True
         return False
 
-    # Evaluate service dicts
     for sector in ["alpha", "beta", "gamma"]:
         svc_var = {"alpha": alpha_service, "beta": beta_service, "gamma": gamma_service}[sector]
 
@@ -759,7 +748,6 @@ def process_file_streamlit(user_file_path: str,
                         if target.get(k) is None and v is not None:
                             target[k] = v
 
-    # Helper: retry single images (normal then careful)
     def _retry_image_and_merge(image_name: str, sector_var_map: dict) -> bool:
         image_path = os.path.join(images_temp, f"{image_name}.png")
         if not os.path.exists(image_path):
@@ -900,7 +888,6 @@ def process_file_streamlit(user_file_path: str,
                     log_append(text_area_placeholder, logs, f"[RULE2] {name} missing {missing}. Re-evaluating.")
                     _retry_image_and_merge(name, video_map)
 
-    # voicetest checks
     log_append(text_area_placeholder, logs, "[RULE2] Verifying voicetest completeness.")
     for idx in [1, 2, 3]:
         name = f"voicetest_image_{idx}"
@@ -922,7 +909,6 @@ def process_file_streamlit(user_file_path: str,
 
     log_append(text_area_placeholder, logs, "[LOG] Rule 2 verification complete.")
 
-    # ---------- compute averages ----------
     def _to_number(v):
         try:
             if v is None:
@@ -957,7 +943,6 @@ def process_file_streamlit(user_file_path: str,
         "avearge_gamma_speedtest": _compute_speed_averages(gamma_speedtest),
     }
 
-    # ---------------- Mapping: extract bold+red expressions and replace ----------------
     log_append(text_area_placeholder, logs, "[LOG] Scanning workbook for BOLD+RED expressions and replacing with values.")
 
     try:
@@ -1063,288 +1048,6 @@ def process_file_streamlit(user_file_path: str,
     except Exception as e:
         log_append(text_area_placeholder, logs, f"[ERROR] Failed mapping pass: {e}")
 
-    # ---------------- Rule 3: remap NULL cells using strict AI re-checks ----------------
-    log_append(text_area_placeholder, logs, "[LOG] Running Rule 3: remap any remaining NULL bold+red expressions with AI.")
-
-    try:
-        wb_r3 = openpyxl.load_workbook(local_template)
-        sheet_r3 = wb_r3.active
-
-        allowed_vars = {
-            "alpha_service": alpha_service,
-            "beta_service": beta_service,
-            "gamma_service": gamma_service,
-            "alpha_speedtest": alpha_speedtest,
-            "beta_speedtest": beta_speedtest,
-            "gamma_speedtest": gamma_speedtest,
-            "alpha_video": alpha_video,
-            "beta_video": beta_video,
-            "gamma_video": gamma_video,
-            "voice_test": voice_test,
-            "avearge": avearge,
-        }
-
-        problematic_cells = []
-
-        for row in sheet_r3.iter_rows(min_row=1, max_row=sheet_r3.max_row, min_col=1, max_col=16):
-            for cell in row:
-                val = cell.value
-                if not isinstance(val, str):
-                    continue
-                if val.strip().upper() != "NULL":
-                    continue
-
-                font = cell.font
-                if font and _font_is_strict_red(font):
-                    problematic_cells.append(cell)
-
-        remapped = 0
-
-        for cell in problematic_cells:
-            # find a candidate expression from extract_text that references a known base var
-            candidate = None
-            for ex in extract_text:
-                mm = re.match(r"^([A-Za-z_]\w*)", ex.strip())
-                if not mm:
-                    continue
-                base = mm.group(1)
-
-                # normalize base
-                if _normalize_name(base) in {_normalize_name(k) for k in allowed_vars.keys()}:
-                    if resolve_expression_with_vars(ex, allowed_vars) is None:
-                        candidate = ex
-                        break
-
-            if not candidate:
-                continue
-
-            expr = candidate
-            log_append(text_area_placeholder, logs, f"[RULE3] Attempting strict re-map '{expr}' for cell {cell.coordinate}")
-
-            m = re.match(r"^([A-Za-z_]\w*)(.*)$", expr)
-            if not m:
-                log_append(text_area_placeholder, logs, f"[RULE3] Could not parse '{expr}'. Skipping.")
-                continue
-
-            base_raw = m.group(1)
-            rest = m.group(2) or ""
-
-            norm_map = {_normalize_name(k): k for k in allowed_vars.keys()}
-            base_key = norm_map.get(_normalize_name(base_raw))
-
-            if not base_key:
-                log_append(text_area_placeholder, logs, f"[RULE3] Base '{base_raw}' not found. Skipping.")
-                continue
-
-            # If service variable, try re-evaluate images first
-            if base_key in ("alpha_service", "beta_service", "gamma_service"):
-                sector = base_key.split("_")[0]
-                img1 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_1")), None)
-                img2 = next((p for p in images_by_sector[sector] if Path(p).stem.endswith("_image_2")), None)
-
-                if img1 and img2:
-                    log_append(text_area_placeholder, logs, f"[RULE3] Re-evaluating service images for {sector} (strict).")
-                    svc_eval = evaluate_service_images(token, img1, img2, model_service, text_area_placeholder, logs)
-
-                    if svc_eval:
-                        allowed_vars[base_key].update(svc_eval)
-
-                    resolved_after = resolve_expression_with_vars(expr, allowed_vars)
-                    if resolved_after is not None:
-                        keys = key_pattern.findall(rest)
-                        set_nested_value_case_insensitive(allowed_vars[base_key], keys, resolved_after)
-
-                        if isinstance(resolved_after, (int, float)):
-                            cell.value = resolved_after
-                        elif isinstance(resolved_after, str):
-                            cell.value = resolved_after
-                        else:
-                            try:
-                                cell.value = json.dumps(resolved_after)
-                            except Exception:
-                                cell.value = str(resolved_after)
-
-                        remapped += 1
-                        continue
-
-                log_append(text_area_placeholder, logs, f"[RULE3] Asking model for '{expr}' using '{base_key}'")
-                value = ask_model_for_expression_value(token, base_key, allowed_vars[base_key], expr, model_generic, text_area_placeholder, logs)
-
-                if value is not None:
-                    keys = key_pattern.findall(rest)
-                    set_nested_value_case_insensitive(allowed_vars[base_key], keys, value)
-
-                    if isinstance(value, (int, float)):
-                        cell.value = value
-                    elif isinstance(value, str):
-                        cell.value = value
-                    else:
-                        try:
-                            cell.value = json.dumps(value)
-                        except Exception:
-                            cell.value = str(value)
-
-                    remapped += 1
-                    continue
-                else:
-                    log_append(text_area_placeholder, logs, f"[RULE3] Model couldn't provide value for '{expr}'.")
-                    continue
-
-            else:
-                # For non-service variables (speed/video/voice), expect image key as first bracket
-                keys = key_pattern.findall(rest)
-                if not keys:
-                    log_append(text_area_placeholder, logs, f"[RULE3] No keys in '{expr}'. Skipping.")
-                    continue
-
-                image_key = keys[0]
-                file_path = None
-
-                for lst in images_by_sector.values():
-                    for p in lst:
-                        if Path(p).stem == image_key:
-                            file_path = p
-                            break
-                    if file_path:
-                        break
-
-                if not file_path:
-                    log_append(text_area_placeholder, logs, f"[RULE3] No file for image '{image_key}'. Asking model with '{base_key}'.")
-                    value = ask_model_for_expression_value(token, base_key, allowed_vars[base_key], expr, model_generic, text_area_placeholder, logs)
-
-                    if value is not None:
-                        set_nested_value_case_insensitive(allowed_vars[base_key], keys[1:], value)
-
-                        if isinstance(value, (int, float)):
-                            cell.value = value
-                        elif isinstance(value, str):
-                            cell.value = value
-                        else:
-                            try:
-                                cell.value = json.dumps(value)
-                            except Exception:
-                                cell.value = str(value)
-
-                        remapped += 1
-                    else:
-                        log_append(text_area_placeholder, logs, f"[RULE3] Could not remap '{expr}'.")
-                    continue
-
-                # If file found: strict evaluate image
-                if image_key.startswith("voicetest"):
-                    log_append(text_area_placeholder, logs, f"[RULE3] Strictly evaluating voice image '{image_key}'.")
-                    voice_eval = evaluate_voice_image(token, file_path, model_generic, text_area_placeholder, logs)
-
-                    if voice_eval and "data" in voice_eval:
-                        voice_test.setdefault(image_key, {}).update(voice_eval["data"])
-
-                    nested_keys = keys[1:]
-                    resolved_after = resolve_expression_with_vars(expr, {**allowed_vars, "voice_test": voice_test})
-
-                    if resolved_after is not None:
-                        set_nested_value_case_insensitive(voice_test, nested_keys, resolved_after)
-
-                        if isinstance(resolved_after, (int, float)):
-                            cell.value = resolved_after
-                        elif isinstance(resolved_after, str):
-                            cell.value = resolved_after
-                        else:
-                            try:
-                                cell.value = json.dumps(resolved_after)
-                            except Exception:
-                                cell.value = str(resolved_after)
-
-                        remapped += 1
-                        continue
-
-                    log_append(text_area_placeholder, logs, f"[RULE3] Asking model for '{expr}' using 'voice_test'.")
-                    value = ask_model_for_expression_value(token, "voice_test", voice_test, expr, model_generic, text_area_placeholder, logs)
-
-                    if value is not None:
-                        set_nested_value_case_insensitive(voice_test, keys[1:], value)
-                        cell.value = value if not isinstance(value, dict) else json.dumps(value)
-                        remapped += 1
-                    else:
-                        log_append(text_area_placeholder, logs, f"[RULE3] Could not remap '{expr}' from voice image.")
-                    continue
-
-                else:
-                    # generic image (speed/video)
-                    log_append(text_area_placeholder, logs, f"[RULE3] Strictly evaluating generic image '{image_key}'.")
-                    gen_eval = evaluate_generic_image(token, file_path, model_generic, text_area_placeholder, logs)
-
-                    if gen_eval and "data" in gen_eval:
-                        pref = image_key.split("_")[0]
-
-                        if pref == "alpha":
-                            if gen_eval.get("image_type") == "speed_test":
-                                alpha_speedtest.setdefault(image_key, {}).update(gen_eval["data"])
-                            elif gen_eval.get("image_type") == "video_test":
-                                alpha_video.setdefault(image_key, {}).update(gen_eval["data"])
-                        elif pref == "beta":
-                            if gen_eval.get("image_type") == "speed_test":
-                                beta_speedtest.setdefault(image_key, {}).update(gen_eval["data"])
-                            elif gen_eval.get("image_type") == "video_test":
-                                beta_video.setdefault(image_key, {}).update(gen_eval["data"])
-                        elif pref == "gamma":
-                            if gen_eval.get("image_type") == "speed_test":
-                                gamma_speedtest.setdefault(image_key, {}).update(gen_eval["data"])
-                            elif gen_eval.get("image_type") == "video_test":
-                                gamma_video.setdefault(image_key, {}).update(gen_eval["data"])
-
-                    # attempt to resolve now
-                    new_allowed = {
-                        "alpha_service": alpha_service, "beta_service": beta_service, "gamma_service": gamma_service,
-                        "alpha_speedtest": alpha_speedtest, "beta_speedtest": beta_speedtest, "gamma_speedtest": gamma_speedtest,
-                        "alpha_video": alpha_video, "beta_video": beta_video, "gamma_video": gamma_video,
-                        "voice_test": voice_test, "avearge": avearge,
-                    }
-
-                    resolved_after = resolve_expression_with_vars(expr, new_allowed)
-
-                    if resolved_after is not None:
-                        nested_keys = keys[1:]
-                        set_nested_value_case_insensitive(new_allowed[base_key], nested_keys, resolved_after)
-
-                        if isinstance(resolved_after, (int, float)):
-                            cell.value = resolved_after
-                        elif isinstance(resolved_after, str):
-                            cell.value = resolved_after
-                        else:
-                            try:
-                                cell.value = json.dumps(resolved_after)
-                            except Exception:
-                                cell.value = str(resolved_after)
-
-                        remapped += 1
-                        continue
-
-                    log_append(text_area_placeholder, logs, f"[RULE3] Asking model for '{expr}' using '{base_key}'.")
-                    value = ask_model_for_expression_value(token, base_key, new_allowed[base_key], expr, model_generic, text_area_placeholder, logs)
-
-                    if value is not None:
-                        set_nested_value_case_insensitive(new_allowed[base_key], keys[1:], value)
-
-                        if isinstance(value, (int, float)):
-                            cell.value = value
-                        elif isinstance(value, str):
-                            cell.value = value
-                        else:
-                            try:
-                                cell.value = json.dumps(value)
-                            except Exception:
-                                cell.value = str(value)
-
-                        remapped += 1
-                    else:
-                        log_append(text_area_placeholder, logs, f"[RULE3] Could not remap '{expr}' from generic image.")
-
-        wb_r3.save(local_template)
-        log_append(text_area_placeholder, logs, f"[RULE3] Rule 3 pass complete. Remapped {remapped} cells.")
-
-    except Exception as e:
-        log_append(text_area_placeholder, logs, f"[RULE3 ERROR] {e}")
-
     log_append(text_area_placeholder, logs, "[SUCCESS] Processing complete!")
     return local_template
 
@@ -1359,21 +1062,18 @@ def main():
     The tool will extract data from images using AI vision and populate bold+red expressions in the template.
     """)
 
-    # API Key
     if "api_token" not in st.session_state:
         st.session_state["api_token"] = ""
 
     api_token = st.text_input("Enter your Apify API Key:", type="password", value=st.session_state.get("api_token", ""))
 
     if api_token and api_token != st.session_state.get("api_token", ""):
-        # validate format
         if api_token.startswith("apify_api_"):
             st.session_state["api_token"] = api_token
             st.success("[UI] API token stored (format validated).")
         else:
             st.error("[UI] Invalid API token format (must start with 'apify_api_').")
 
-    # File uploader
     uploaded_file = st.file_uploader("Upload Excel Template (.xlsx)", type=["xlsx"])
 
     if uploaded_file and st.session_state.get("api_token"):
@@ -1381,15 +1081,12 @@ def main():
             st.session_state["logs"] = []
             st.session_state["logs"].append("[UI] Starting processing...")
 
-            # create a temp directory
             temp_dir = tempfile.mkdtemp(prefix="streamlit_")
 
-            # save uploaded file
             user_file_path = os.path.join(temp_dir, uploaded_file.name)
             with open(user_file_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
 
-            # placeholder for logs
             log_placeholder = st.empty()
 
             result_path = process_file_streamlit(
@@ -1411,7 +1108,6 @@ def main():
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
 
-                # cleanup
                 try:
                     shutil.rmtree(temp_dir)
                 except Exception:
