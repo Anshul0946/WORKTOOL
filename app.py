@@ -136,13 +136,14 @@ def clean_json_response(content: str) -> str:
     content = content.strip()
     
     # Remove markdown code block wrappers
-    if content.startswith("```
+    if content.startswith("```"):
         # Remove opening ```json or ```
         content = re.sub(r'^```(?:json)?\s*\n?', '', content)
         # Remove closing ```
         content = re.sub(r'\n?```\s*$', '', content)
     
     return content.strip()
+
 
 # ---------------- Image extraction (only .xlsx now) ----------------
 def extract_images_from_excel(xlsx_path: str, output_folder: str, log_placeholder, logs: list) -> List[str]:
