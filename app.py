@@ -187,55 +187,79 @@ def safe_merge_into_map(sector_map, image_name, data, log_placeholder, logs):
 def clear_processing_cache(temp_dir: str, keep_api_token: bool = True):
     """
     Clears temp folders and resets all processing globals.
-    Does NOT clear the API token if keep_api_token=True.
-    Safe to call before new file processing.
+    Keeps API token if keep_api_token=True.
+    Ensures each global is reset with the correct default type.
     """
 
-    # Preserve token if needed
+    # ----------------------------
+    # Preserve token
+    # ----------------------------
     saved_token = None
     if keep_api_token and "APIFY_TOKEN" in st.session_state:
         saved_token = st.session_state["APIFY_TOKEN"]
 
-    # Delete temp directory (images, intermediate files)
+    # ----------------------------
+    # Delete temp directory
+    # ----------------------------
     try:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
     except Exception as e:
         if "logs" in st.session_state:
-            st.session_state["logs"].append(f"[CACHE CLEAR] Could not remove temp dir {temp_dir}: {e}")
+            st.session_state["logs"].append(
+                f"[CACHE CLEAR] Could not remove temp dir {temp_dir}: {e}"
+            )
         else:
             print(f"[CACHE CLEAR] Could not remove temp dir {temp_dir}: {e}")
 
-    # Reset core global dicts
-    to_reset = [
-        "alpha_service", "beta_service", "gamma_service",
-        "alpha_speedtest", "beta_speedtest", "gamma_speedtest",
-        "alpha_video", "beta_video", "gamma_video",
-        "voice_test", "extract_text", "avearge", "retried_images"
-    ]
+    # ----------------------------
+    # Reset processing globals with CORRECT TYPES
+    # ----------------------------
+    type_defaults = {
+        "alpha_service": {},
+        "beta_service": {},
+        "gamma_service": {},
+        "alpha_speedtest": {},
+        "beta_speedtest": {},
+        "gamma_speedtest": {},
+        "alpha_video": {},
+        "beta_video": {},
+        "gamma_video": {},
+        "voice_test": {},
+        "extract_text": [],       # Must be list
+        "avearge": {},            # Dict
+        "retried_images": set()   # Must be set
+    }
 
-    for var in to_reset:
+    for var_name, default_value in type_defaults.items():
         try:
-            if var in globals():
-                if isinstance(globals()[var], dict):
-                    globals()[var].clear()
-                else:
-                    globals()[var] = {}
-        except:
+            if isinstance(default_value, dict):
+                globals()[var_name] = {}
+            elif isinstance(default_value, list):
+                globals()[var_name] = []
+            elif isinstance(default_value, set):
+                globals()[var_name] = set()
+            else:
+                globals()[var_name] = default_value
+        except Exception:
             pass
 
-    # Reinitialize retried_images properly as a set
-    globals()["retried_images"] = set()
-
-    # Restore token if preserved
+    # ----------------------------
+    # Restore token
+    # ----------------------------
     if keep_api_token and saved_token:
         st.session_state["APIFY_TOKEN"] = saved_token
 
-    # Log action
+    # ----------------------------
+    # Log result
+    # ----------------------------
     if "logs" in st.session_state:
-        st.session_state["logs"].append("[CACHE CLEAR] Processing cache cleared. Token preserved.")
+        st.session_state["logs"].append(
+            "[CACHE CLEAR] Processing cache cleared. Token preserved."
+        )
     else:
         print("[CACHE CLEAR] Processing cache cleared. Token preserved.")
+
 
 #------------------------------------------------------------------
 
@@ -1143,14 +1167,7 @@ def process_file_streamlit(user_file_path: str,
                             target[k] = v
 
     # Helper: retry single images (normal then careful)
-    def _retry_image_and_merge(
-    image_name: str,
-    sector_var_map: dict,
-    token: str,
-    model_generic_local: str,
-    text_area_placeholder,
-    logs: list
-) -> bool:
+    def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, model_generic_local: str, text_area_placeholder, logs: list) -> bool:
     """
     SAFEST version of retry logic.
     - Prevents .items() crashes
@@ -1162,11 +1179,16 @@ def process_file_streamlit(user_file_path: str,
     """
 
     # -----------------------------
-    # Locate image path
+    # Locate image path (Fix applied: prefer local temp_dir)
     # -----------------------------
     images_temp_path = None
-    if "temp_dir" in globals():
-        images_temp_path = os.path.join(temp_dir, "images")
+    try:
+        if "temp_dir" in locals() and temp_dir:
+            images_temp_path = os.path.join(temp_dir, "images")
+        elif "temp_dir" in globals() and globals().get("temp_dir"):
+            images_temp_path = os.path.join(globals().get("temp_dir"), "images")
+    except Exception:
+        images_temp_path = None
 
     image_path = None
 
@@ -1205,7 +1227,6 @@ def process_file_streamlit(user_file_path: str,
                    f"[EVAL] Already retried '{image_name}'. Skipping.")
         return False
 
-    # Mark as retried
     retried_images.add(normalized_path)
 
     is_voice = image_name.lower().startswith("voicetest")
@@ -1243,15 +1264,13 @@ def process_file_streamlit(user_file_path: str,
     # If image_type exists but data missing → salvage
     if isinstance(normal_res, dict):
         img_type = normal_res.get("image_type")
-        if isinstance(img_type, str) and img_type.lower() in {
-            "speed_test", "video_test", "voice_call"
-        }:
+        if isinstance(img_type, str) and img_type.lower() in {"speed_test", "video_test", "voice_call"}:
             data = safe_get_data(normal_res)
             if data:
                 safe_merge_into_map(sector_var_map, image_name, data,
                                     text_area_placeholder, logs)
                 log_append(text_area_placeholder, logs,
-                           f"[EVAL] Salvaged partial data for '{image_name}' from normal retry.")
+                           f"[EVAL] Salvaged partial data from normal retry for '{image_name}'.")
                 return True
 
     # -----------------------------
@@ -1297,7 +1316,7 @@ def process_file_streamlit(user_file_path: str,
         safe_merge_into_map(sector_var_map, image_name, data,
                             text_area_placeholder, logs)
         log_append(text_area_placeholder, logs,
-                   f"[EVAL] Careful evaluation produced partial usable data for '{image_name}'. Merged.")
+                   f"[EVAL] Careful eval returned partial usable data for '{image_name}'. Merged.")
         return True
 
     # Nothing usable
