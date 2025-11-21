@@ -1167,7 +1167,10 @@ def process_file_streamlit(user_file_path: str,
                             target[k] = v
 
     # Helper: retry single images (normal then careful)
-    def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, model_generic_local: str, text_area_placeholder, logs: list) -> bool:
+    import os
+from pathlib import Path
+
+def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, model_generic_local: str, text_area_placeholder, logs: list) -> bool:
     """
     SAFEST version of retry logic.
     - Prevents .items() crashes
@@ -1183,8 +1186,9 @@ def process_file_streamlit(user_file_path: str,
     # -----------------------------
     images_temp_path = None
     try:
-        if "temp_dir" in locals() and temp_dir:
-            images_temp_path = os.path.join(temp_dir, "images")
+        # Check if temp_dir is defined in local scope or global scope
+        if "temp_dir" in locals() and locals().get("temp_dir"):
+            images_temp_path = os.path.join(locals().get("temp_dir"), "images")
         elif "temp_dir" in globals() and globals().get("temp_dir"):
             images_temp_path = os.path.join(globals().get("temp_dir"), "images")
     except Exception:
@@ -1198,10 +1202,10 @@ def process_file_streamlit(user_file_path: str,
         if os.path.exists(candidate):
             image_path = candidate
 
-    # Second: search in images_by_sector
-    if not image_path:
+    # Second: search in images_by_sector (Assumes images_by_sector is a global variable)
+    if not image_path and "images_by_sector" in globals():
         found_path = None
-        for sector_list in images_by_sector.values():
+        for sector_list in globals()["images_by_sector"].values():
             for p in sector_list:
                 try:
                     if Path(p).stem == image_name:
@@ -1214,20 +1218,22 @@ def process_file_streamlit(user_file_path: str,
         if found_path:
             image_path = found_path
 
-    # If STILL not found → skip
+    # If STILL not found -> skip
     if not image_path:
         log_append(text_area_placeholder, logs,
                    f"[EVAL WARN] Image '{image_name}' not found for retry.")
         return False
 
-    # Prevent multiple retries of same physical file
+    # Prevent multiple retries of same physical file (Assumes retried_images is a global set)
     normalized_path = os.path.abspath(image_path)
-    if normalized_path in retried_images:
+    
+    if "retried_images" in globals() and normalized_path in globals()["retried_images"]:
         log_append(text_area_placeholder, logs,
                    f"[EVAL] Already retried '{image_name}'. Skipping.")
         return False
-
-    retried_images.add(normalized_path)
+    
+    if "retried_images" in globals():
+        globals()["retried_images"].add(normalized_path)
 
     is_voice = image_name.lower().startswith("voicetest")
     log_append(text_area_placeholder, logs,
@@ -1252,7 +1258,7 @@ def process_file_streamlit(user_file_path: str,
                    f"[EVAL ERROR] Normal analyze crashed for '{image_name}': {e}")
         normal_res = None
 
-    # If result is valid JSON → merge
+    # If result is valid JSON -> merge
     if normal_res and is_valid_generic_result(normal_res):
         data = safe_get_data(normal_res)
         safe_merge_into_map(sector_var_map, image_name, data,
@@ -1261,7 +1267,7 @@ def process_file_streamlit(user_file_path: str,
                    f"[EVAL] Normal retry SUCCESS for '{image_name}'.")
         return True
 
-    # If image_type exists but data missing → salvage
+    # If image_type exists but data missing -> salvage
     if isinstance(normal_res, dict):
         img_type = normal_res.get("image_type")
         if isinstance(img_type, str) and img_type.lower() in {"speed_test", "video_test", "voice_call"}:
@@ -1323,6 +1329,7 @@ def process_file_streamlit(user_file_path: str,
     log_append(text_area_placeholder, logs,
                f"[EVAL] No usable data found for '{image_name}' after all retries.")
     return False
+
 
 
     sector_maps = [
