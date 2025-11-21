@@ -1167,8 +1167,6 @@ def process_file_streamlit(user_file_path: str,
                             target[k] = v
 
     # Helper: retry single images (normal then careful)
-    import os
-from pathlib import Path
 
 def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, model_generic_local: str, temp_dir: str, text_area_placeholder, logs: list) -> bool:
     """
