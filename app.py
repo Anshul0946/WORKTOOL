@@ -92,6 +92,407 @@ extract_text = []
 avearge = {}
 
 # ---------------- Helpers ----------------
+
+def is_valid_generic_result(result):
+    """
+    Validates outputs of analyze_generic_image / evaluate_generic_image.
+    A valid result must:
+    - be a dict
+    - contain image_type as string
+    - have image_type in allowed categories
+    - have data as a dict (empty dict allowed)
+    """
+    if not isinstance(result, dict):
+        return False
+
+    image_type = result.get("image_type", None)
+    if not isinstance(image_type, str):
+        return False
+
+    if image_type.lower().strip() not in {"speed_test", "video_test", "voice_call"}:
+        return False
+
+    data = result.get("data", {})
+    if not isinstance(data, dict):
+        return False
+
+    return True
+
+
+def safe_get_data(result):
+    """
+    Always returns a dict for result['data'].
+    Prevents AttributeError when model returns:
+    - data: null
+    - data: ""
+    - data: []
+    - data missing
+    - malformed result
+
+    If invalid, returns {} instead of None.
+    """
+    if not isinstance(result, dict):
+        return {}
+
+    data = result.get("data", {})
+
+    if isinstance(data, dict):
+        return data
+
+    # model sometimes sends string, null, float, etc → convert to empty dict
+    return {}
+
+#----------------------------------------------
+def safe_merge_into_map(sector_map, image_name, data, log_placeholder, logs):
+    """
+    Safely merges extracted 'data' into the dictionary:
+        sector_map[image_name] = { ... }
+
+    - Ensures sector_map[image_name] always exists
+    - Writes only keys that are non-None
+    - Does NOT overwrite existing non-None values
+    - Handles case-insensitive key matching
+    - Prevents crashes due to None or wrong data types
+    """
+
+    if not isinstance(data, dict):
+        return  # nothing to merge
+
+    # Ensure the image entry exists
+    sector_map.setdefault(image_name, {})
+    target = sector_map[image_name]
+
+    for k, v in data.items():
+        # skip None values
+        if v is None:
+            continue
+
+        # find existing key ignoring case
+        found_key = None
+        for real_key in target.keys():
+            if real_key.lower() == k.lower():
+                found_key = real_key
+                break
+
+        # If key exists and has no value → fill it
+        if found_key:
+            if target.get(found_key) is None:
+                target[found_key] = v
+        else:
+            # new key
+            target[k] = v
+
+#--------------------------------------------------
+
+def clear_processing_cache(temp_dir: str, keep_api_token: bool = True):
+    """
+    Clears temp folders and resets all processing globals.
+    Does NOT clear the API token if keep_api_token=True.
+    Safe to call before new file processing.
+    """
+
+    # Preserve token if needed
+    saved_token = None
+    if keep_api_token and "APIFY_TOKEN" in st.session_state:
+        saved_token = st.session_state["APIFY_TOKEN"]
+
+    # Delete temp directory (images, intermediate files)
+    try:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+    except Exception as e:
+        if "logs" in st.session_state:
+            st.session_state["logs"].append(f"[CACHE CLEAR] Could not remove temp dir {temp_dir}: {e}")
+        else:
+            print(f"[CACHE CLEAR] Could not remove temp dir {temp_dir}: {e}")
+
+    # Reset core global dicts
+    to_reset = [
+        "alpha_service", "beta_service", "gamma_service",
+        "alpha_speedtest", "beta_speedtest", "gamma_speedtest",
+        "alpha_video", "beta_video", "gamma_video",
+        "voice_test", "extract_text", "avearge", "retried_images"
+    ]
+
+    for var in to_reset:
+        try:
+            if var in globals():
+                if isinstance(globals()[var], dict):
+                    globals()[var].clear()
+                else:
+                    globals()[var] = {}
+        except:
+            pass
+
+    # Reinitialize retried_images properly as a set
+    globals()["retried_images"] = set()
+
+    # Restore token if preserved
+    if keep_api_token and saved_token:
+        st.session_state["APIFY_TOKEN"] = saved_token
+
+    # Log action
+    if "logs" in st.session_state:
+        st.session_state["logs"].append("[CACHE CLEAR] Processing cache cleared. Token preserved.")
+    else:
+        print("[CACHE CLEAR] Processing cache cleared. Token preserved.")
+
+#------------------------------------------------------------------
+
+def safe_process_service(
+    token: str,
+    img1: str,
+    img2: str,
+    model_service_local: str,
+    text_area_placeholder,
+    logs: list
+):
+    """
+    Safe wrapper for process_service_images().
+    Prevents crashes when model returns:
+    - null
+    - {}
+    - wrong type
+    - malformed data
+
+    Always returns a dict (possibly empty), never None.
+    """
+
+    try:
+        svc = process_service_images(
+            token,
+            img1,
+            img2,
+            model_service_local,
+            text_area_placeholder,
+            logs
+        )
+    except Exception as e:
+        log_append(text_area_placeholder, logs,
+                   f"[SERVICE ERROR] process_service_images crashed: {e}")
+        return {}
+
+    if not svc or not isinstance(svc, dict):
+        log_append(text_area_placeholder, logs,
+                   "[SERVICE WARN] service extraction returned no valid dict. Using {}.")
+        return {}
+
+    # Clean None values but keep keys
+    cleaned = {}
+    for k, v in svc.items():
+        cleaned[k] = v if v is not None else None
+
+    return cleaned
+#-----------------------------------------------------------------
+def safe_evaluate_service(
+    token: str,
+    img1: str,
+    img2: str,
+    model_service_local: str,
+    text_area_placeholder,
+    logs: list
+):
+    """
+    Safe wrapper around evaluate_service_images().
+    Ensures careful evaluation NEVER crashes and ALWAYS returns a dict.
+    If evaluation returns invalid JSON, null, or empty → returns {}.
+    """
+
+    try:
+        svc = evaluate_service_images(
+            token,
+            img1,
+            img2,
+            model_service_local,
+            text_area_placeholder,
+            logs
+        )
+    except Exception as e:
+        log_append(text_area_placeholder, logs,
+                   f"[SERVICE EVAL ERROR] evaluate_service_images crashed: {e}")
+        return {}
+
+    # svc must be a dict; otherwise it's unusable
+    if not svc or not isinstance(svc, dict):
+        log_append(text_area_placeholder, logs,
+                   "[SERVICE EVAL WARN] careful eval returned no valid dict.")
+        return {}
+
+    # Clean None values but preserve keys
+    cleaned = {}
+    for k, v in svc.items():
+        cleaned[k] = v if v is not None else None
+
+    return cleaned
+#------------------------------------------------------------------
+
+def rule2_missing_service_fields(service_dict: dict):
+    """
+    Returns a list of missing service fields based on SERVICE_SCHEMA.
+    Does NOT crash if service_dict is None, wrong type, or empty.
+
+    Example:
+        SERVICE_SCHEMA = { "lte_bw": "", "nr_bw": "", "lte_rsrp": "" }
+        service_dict = { "lte_bw": "20MHz" }
+        → returns ["nr_bw", "lte_rsrp"]
+    """
+
+    # If service_dict is missing or invalid → everything is missing
+    if not isinstance(service_dict, dict):
+        return list(SERVICE_SCHEMA.keys())
+
+    missing = []
+    for key in SERVICE_SCHEMA.keys():
+        if key not in service_dict or service_dict.get(key) is None:
+            missing.append(key)
+
+    return missing
+#----------------------------------------------------------------------
+def rule2_merge_service(target: dict, source: dict):
+    """
+    Safely merges missing service fields.
+    - Does NOT overwrite values that already exist in target
+    - Writes only values that are non-None in source
+    - Never crashes on invalid inputs
+
+    Example:
+        target = {"lte_bw": None, "nr_bw": "60MHz"}
+        source = {"lte_bw": "20MHz", "nr_bw": None}
+
+        → result target = {"lte_bw": "20MHz", "nr_bw": "60MHz"}
+    """
+
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+
+    for key, value in source.items():
+        if value is None:
+            continue
+        # Only update if target is missing or None
+        if key not in target or target.get(key) is None:
+            target[key] = value
+#-----------------------------------------------------------------
+
+def safe_resolve_or_null(expr: str, allowed_vars: dict):
+    """
+    Safely evaluates template expressions like:
+        {{ alpha_speedtest.download }}
+        {{ beta_service.lte_bw }}
+        {{ gamma_video.avg_fps }}
+
+    If resolution fails for ANY reason:
+        - missing variable
+        - missing nested field
+        - malformed expression
+        - numeric/syntax errors
+
+    → returns None instead of throwing an exception.
+    """
+
+    try:
+        value = resolve_expression_with_vars(expr, allowed_vars)
+        return value
+    except Exception:
+        return None
+#---------------------------------------------------------------
+def safe_place_value_in_cell(cell, value):
+    """
+    Safely writes a value into an Excel cell.
+    Prevents crashes when:
+    - value is dict
+    - value is list
+    - value is None
+    - openpyxl rejects the type
+    - json serialization fails
+
+    Fallback behavior:
+    - numbers & strings → write directly
+    - dict/list → JSON dump with fallback to string
+    - None → write "NULL"
+    - unknown types → string conversion
+    """
+
+    try:
+        # Simple scalar values
+        if isinstance(value, (int, float, str)):
+            cell.value = value
+            return
+
+        # Dicts or lists → try JSON
+        if isinstance(value, (dict, list)):
+            try:
+                cell.value = json.dumps(value)
+            except Exception:
+                cell.value = str(value)
+            return
+
+        # Explicit None
+        if value is None:
+            cell.value = "NULL"
+            return
+
+        # Anything else → safest fallback
+        cell.value = str(value)
+
+    except Exception:
+        # Final safeguard
+        cell.value = "NULL"
+
+#---------------------------------------------------------------
+def ui_reset_state(temp_dir: str):
+    """
+    Clears all processing state while PRESERVING the API key.
+    This is triggered by a 'Reset' or 'Start Over' button in the UI.
+
+    What it does:
+    - Clears logs
+    - Removes temp image directory
+    - Resets global dicts (speedtest / service / video / voice)
+    - Preserves st.session_state['APIFY_TOKEN']
+    """
+
+    # Save API key before clearing anything
+    saved_token = st.session_state.get("APIFY_TOKEN", None)
+
+    # Reset logs
+    st.session_state["logs"] = ["[UI] Processor reset. Ready for new file."]
+
+    # Clear cached processing data
+    clear_processing_cache(temp_dir, keep_api_token=True)
+
+    # Restore token (safety)
+    if saved_token:
+        st.session_state["APIFY_TOKEN"] = saved_token
+
+    # Add confirmation log
+    st.session_state["logs"].append("[UI] All caches cleared (token preserved).")
+#--------------------------------------------------------------------------------
+
+def fast_log(log_placeholder, logs: list, msg: str):
+    """
+    Faster alternative to log_append():
+    - Appends log entry quickly
+    - Updates Streamlit text_area only every 5 logs
+    - Reduces rerender overhead massively
+
+    You can safely replace log_append() calls with fast_log() in loops.
+    """
+
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    logs.append(f"[{ts}] {msg}")
+
+    # Update UI every 5 logs only → huge speed improvement
+    if len(logs) % 5 == 0:
+        try:
+            log_placeholder.text_area(
+                "Logs",
+                value="\n".join(logs[-2000:]),   # limit to last 2000 lines
+                height=360
+            )
+        except Exception:
+            pass
+#-------------------------------------------------------------------
+
 def _apify_headers(token: str) -> dict:
     return {
         "Authorization": f"Bearer {token}",
@@ -742,56 +1143,168 @@ def process_file_streamlit(user_file_path: str,
                             target[k] = v
 
     # Helper: retry single images (normal then careful)
-    def _retry_image_and_merge(image_name: str, sector_var_map: dict) -> bool:
-        image_path = os.path.join(images_temp, f"{image_name}.png")
-        if not os.path.exists(image_path):
-            found = None
-            for s_list in images_by_sector.values():
-                for p in s_list:
+    def _retry_image_and_merge(
+    image_name: str,
+    sector_var_map: dict,
+    token: str,
+    model_generic_local: str,
+    text_area_placeholder,
+    logs: list
+) -> bool:
+    """
+    SAFEST version of retry logic.
+    - Prevents .items() crashes
+    - Handles None outputs
+    - Handles invalid or empty 'data'
+    - Searches all image directories
+    - Respects retried_images set
+    - Logs all steps clearly
+    """
+
+    # -----------------------------
+    # Locate image path
+    # -----------------------------
+    images_temp_path = None
+    if "temp_dir" in globals():
+        images_temp_path = os.path.join(temp_dir, "images")
+
+    image_path = None
+
+    # First: temp folder
+    if images_temp_path:
+        candidate = os.path.join(images_temp_path, f"{image_name}.png")
+        if os.path.exists(candidate):
+            image_path = candidate
+
+    # Second: search in images_by_sector
+    if not image_path:
+        found_path = None
+        for sector_list in images_by_sector.values():
+            for p in sector_list:
+                try:
                     if Path(p).stem == image_name:
-                        found = p
+                        found_path = p
                         break
-                if found:
-                    break
-            if found:
-                image_path = found
-            else:
-                log_append(text_area_placeholder, logs, f"[EVAL WARN] Image {image_name} not found. Skipping.")
-                return False
-        if image_path in retried_images:
-            return False
+                except Exception:
+                    continue
+            if found_path:
+                break
+        if found_path:
+            image_path = found_path
 
-        is_voice = image_name.startswith("voicetest")
-        log_append(text_area_placeholder, logs, f"[EVAL] Attempting normal analyze for {image_name}.")
+    # If STILL not found → skip
+    if not image_path:
+        log_append(text_area_placeholder, logs,
+                   f"[EVAL WARN] Image '{image_name}' not found for retry.")
+        return False
+
+    # Prevent multiple retries of same physical file
+    normalized_path = os.path.abspath(image_path)
+    if normalized_path in retried_images:
+        log_append(text_area_placeholder, logs,
+                   f"[EVAL] Already retried '{image_name}'. Skipping.")
+        return False
+
+    # Mark as retried
+    retried_images.add(normalized_path)
+
+    is_voice = image_name.lower().startswith("voicetest")
+    log_append(text_area_placeholder, logs,
+               f"[EVAL] Retrying '{image_name}' at {image_path}")
+
+    # -----------------------------
+    # STEP 1: NORMAL ANALYZE
+    # -----------------------------
+    try:
         if is_voice:
-            normal_res = analyze_voice_image(token, image_path, model_generic, text_area_placeholder, logs)
+            normal_res = analyze_voice_image(
+                token, image_path, model_generic_local,
+                text_area_placeholder, logs
+            )
         else:
-            normal_res = analyze_generic_image(token, image_path, model_generic, text_area_placeholder, logs)
+            normal_res = analyze_generic_image(
+                token, image_path, model_generic_local,
+                text_area_placeholder, logs
+            )
+    except Exception as e:
+        log_append(text_area_placeholder, logs,
+                   f"[EVAL ERROR] Normal analyze crashed for '{image_name}': {e}")
+        normal_res = None
 
-        retried_images.add(image_path)
-        if normal_res and "image_type" in normal_res:
-            sector_var_map.setdefault(image_name, {})
-            data = normal_res.get("data", {})
-            for k, v in data.items():
-                if sector_var_map[image_name].get(k) is None and v is not None:
-                    sector_var_map[image_name][k] = v
-            return True
-
-        log_append(text_area_placeholder, logs, f"[EVAL] Normal analyze didn't help for {image_name}. Trying careful evaluation.")
-        if is_voice:
-            eval_res = evaluate_voice_image(token, image_path, model_generic, text_area_placeholder, logs)
-        else:
-            eval_res = evaluate_generic_image(token, image_path, model_generic, text_area_placeholder, logs)
-
-        if not eval_res or "image_type" not in eval_res:
-            log_append(text_area_placeholder, logs, f"[EVAL] Careful evaluation returned nothing for {image_name}.")
-            return False
-
-        sector_var_map.setdefault(image_name, {})
-        for k, v in eval_res.get("data", {}).items():
-            if sector_var_map[image_name].get(k) is None and v is not None:
-                sector_var_map[image_name][k] = v
+    # If result is valid JSON → merge
+    if normal_res and is_valid_generic_result(normal_res):
+        data = safe_get_data(normal_res)
+        safe_merge_into_map(sector_var_map, image_name, data,
+                            text_area_placeholder, logs)
+        log_append(text_area_placeholder, logs,
+                   f"[EVAL] Normal retry SUCCESS for '{image_name}'.")
         return True
+
+    # If image_type exists but data missing → salvage
+    if isinstance(normal_res, dict):
+        img_type = normal_res.get("image_type")
+        if isinstance(img_type, str) and img_type.lower() in {
+            "speed_test", "video_test", "voice_call"
+        }:
+            data = safe_get_data(normal_res)
+            if data:
+                safe_merge_into_map(sector_var_map, image_name, data,
+                                    text_area_placeholder, logs)
+                log_append(text_area_placeholder, logs,
+                           f"[EVAL] Salvaged partial data for '{image_name}' from normal retry.")
+                return True
+
+    # -----------------------------
+    # STEP 2: CAREFUL EVALUATION
+    # -----------------------------
+    log_append(text_area_placeholder, logs,
+               f"[EVAL] Normal retry failed. Running careful evaluation for '{image_name}'.")
+
+    try:
+        if is_voice:
+            eval_res = evaluate_voice_image(
+                token, image_path, model_generic_local,
+                text_area_placeholder, logs
+            )
+        else:
+            eval_res = evaluate_generic_image(
+                token, image_path, model_generic_local,
+                text_area_placeholder, logs
+            )
+    except Exception as e:
+        log_append(text_area_placeholder, logs,
+                   f"[EVAL ERROR] Careful evaluation crashed for '{image_name}': {e}")
+        eval_res = None
+
+    # No result
+    if not eval_res:
+        log_append(text_area_placeholder, logs,
+                   f"[EVAL] Careful evaluation returned nothing for '{image_name}'.")
+        return False
+
+    # Valid structured result
+    if is_valid_generic_result(eval_res):
+        data = safe_get_data(eval_res)
+        safe_merge_into_map(sector_var_map, image_name, data,
+                            text_area_placeholder, logs)
+        log_append(text_area_placeholder, logs,
+                   f"[EVAL] Careful retry SUCCESS for '{image_name}'.")
+        return True
+
+    # Invalid structure but contains data dict
+    if isinstance(eval_res, dict) and isinstance(eval_res.get("data"), dict):
+        data = eval_res.get("data", {})
+        safe_merge_into_map(sector_var_map, image_name, data,
+                            text_area_placeholder, logs)
+        log_append(text_area_placeholder, logs,
+                   f"[EVAL] Careful evaluation produced partial usable data for '{image_name}'. Merged.")
+        return True
+
+    # Nothing usable
+    log_append(text_area_placeholder, logs,
+               f"[EVAL] No usable data found for '{image_name}' after all retries.")
+    return False
+
 
     sector_maps = [
         ("alpha", alpha_speedtest, alpha_video),
