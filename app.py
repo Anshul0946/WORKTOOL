@@ -1170,7 +1170,7 @@ def process_file_streamlit(user_file_path: str,
     import os
 from pathlib import Path
 
-def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, model_generic_local: str, text_area_placeholder, logs: list) -> bool:
+def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, model_generic_local: str, temp_dir: str, text_area_placeholder, logs: list) -> bool:
     """
     SAFEST version of retry logic.
     - Prevents .items() crashes
@@ -1381,7 +1381,8 @@ def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, mo
                 file_path = next((p for p in images_by_sector[sector] if Path(p).stem == name), None)
                 if file_path:
                     log_append(text_area_placeholder, logs, f"[RULE2] Found {name}. Processing.")
-                    _retry_image_and_merge(name, speed_map, token, model_generic, text_area_placeholder, logs)
+                    _retry_image_and_merge(name, speed_map, token, model_generic, temp_dir, text_area_placeholder, logs)
+
                 else:
                     log_append(text_area_placeholder, logs, f"[RULE2] No file for expected {name}.")
             else:
@@ -1391,7 +1392,8 @@ def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, mo
                         missing.append(k)
                 if missing:
                     log_append(text_area_placeholder, logs, f"[RULE2] {name} missing {missing}. Re-evaluating.")
-                    _retry_image_and_merge(name, speed_map, token, model_generic, text_area_placeholder, logs)
+                    _retry_image_and_merge(name, speed_map, token, model_generic, temp_dir, text_area_placeholder, logs)
+
 
         for idx in expected_indices["video"]:
             name = f"{sector}_image_{idx}"
@@ -1399,7 +1401,8 @@ def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, mo
                 file_path = next((p for p in images_by_sector[sector] if Path(p).stem == name), None)
                 if file_path:
                     log_append(text_area_placeholder, logs, f"[RULE2] Found video {name}. Processing.")
-                    _retry_image_and_merge(name, video_map, token, model_generic, text_area_placeholder, logs)
+                    _retry_image_and_merge(name, video_map, token, model_generic, temp_dir, text_area_placeholder, logs)
+
                 else:
                     log_append(text_area_placeholder, logs, f"[RULE2] No file for expected video {name}.")
             else:
@@ -1409,7 +1412,8 @@ def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, mo
                         missing.append(k)
                 if missing:
                     log_append(text_area_placeholder, logs, f"[RULE2] {name} missing {missing}. Re-evaluating.")
-                    _retry_image_and_merge(name, video_map, token, model_generic, text_area_placeholder, logs)
+                    _retry_image_and_merge(name, video_map, token, model_generic, temp_dir, text_area_placeholder, logs)
+
 
     # voicetest checks
     log_append(text_area_placeholder, logs, "[RULE2] Verifying voicetest completeness.")
@@ -1419,7 +1423,8 @@ def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, mo
             file_path = next((p for p in images_by_sector["voicetest"] if Path(p).stem == name), None)
             if file_path:
                 log_append(text_area_placeholder, logs, f"[RULE2] Missing voice entry {name}. Processing.")
-                _retry_image_and_merge(name, voice_test, token, model_generic, text_area_placeholder, logs)
+                _retry_image_and_merge(name, voice_test, token, model_generic, temp_dir, text_area_placeholder, logs)
+
             else:
                 log_append(text_area_placeholder, logs, f"[RULE2] No file for expected voice {name}.")
         else:
@@ -1429,7 +1434,7 @@ def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, mo
                     missing.append(k)
             if missing:
                 log_append(text_area_placeholder, logs, f"[RULE2] {name} missing {missing}. Re-evaluating.")
-                _retry_image_and_merge(name, voice_test, token, model_generic, text_area_placeholder, logs)
+                _retry_image_and_merge(name, voice_test, token, model_generic, temp_dir, text_area_placeholder, logs)
 
     log_append(text_area_placeholder, logs, "[LOG] Rule 2 verification complete.")
 
