@@ -263,93 +263,6 @@ def clear_processing_cache(temp_dir: str, keep_api_token: bool = True):
 
 #------------------------------------------------------------------
 
-def safe_process_service(
-    token: str,
-    img1: str,
-    img2: str,
-    model_service_local: str,
-    text_area_placeholder,
-    logs: list
-):
-    """
-    Safe wrapper for process_service_images().
-    Prevents crashes when model returns:
-    - null
-    - {}
-    - wrong type
-    - malformed data
-
-    Always returns a dict (possibly empty), never None.
-    """
-
-    try:
-        svc = process_service_images(
-            token,
-            img1,
-            img2,
-            model_service_local,
-            text_area_placeholder,
-            logs
-        )
-    except Exception as e:
-        log_append(text_area_placeholder, logs,
-                   f"[SERVICE ERROR] process_service_images crashed: {e}")
-        return {}
-
-    if not svc or not isinstance(svc, dict):
-        log_append(text_area_placeholder, logs,
-                   "[SERVICE WARN] service extraction returned no valid dict. Using {}.")
-        return {}
-
-    # Clean None values but keep keys
-    cleaned = {}
-    for k, v in svc.items():
-        cleaned[k] = v if v is not None else None
-
-    return cleaned
-#-----------------------------------------------------------------
-def safe_evaluate_service(
-    token: str,
-    img1: str,
-    img2: str,
-    model_service_local: str,
-    text_area_placeholder,
-    logs: list
-):
-    """
-    Safe wrapper around evaluate_service_images().
-    Ensures careful evaluation NEVER crashes and ALWAYS returns a dict.
-    If evaluation returns invalid JSON, null, or empty → returns {}.
-    """
-
-    try:
-        svc = evaluate_service_images(
-            token,
-            img1,
-            img2,
-            model_service_local,
-            text_area_placeholder,
-            logs
-        )
-    except Exception as e:
-        log_append(text_area_placeholder, logs,
-                   f"[SERVICE EVAL ERROR] evaluate_service_images crashed: {e}")
-        return {}
-
-    # svc must be a dict; otherwise it's unusable
-    if not svc or not isinstance(svc, dict):
-        log_append(text_area_placeholder, logs,
-                   "[SERVICE EVAL WARN] careful eval returned no valid dict.")
-        return {}
-
-    # Clean None values but preserve keys
-    cleaned = {}
-    for k, v in svc.items():
-        cleaned[k] = v if v is not None else None
-
-    return cleaned
-#------------------------------------------------------------------
-
 def rule2_missing_service_fields(service_dict: dict):
     """
     Returns a list of missing service fields based on SERVICE_SCHEMA.
@@ -492,29 +405,6 @@ def ui_reset_state(temp_dir: str):
     st.session_state["logs"].append("[UI] All caches cleared (token preserved).")
 #--------------------------------------------------------------------------------
 
-def fast_log(log_placeholder, logs: list, msg: str):
-    """
-    Faster alternative to log_append():
-    - Appends log entry quickly
-    - Updates Streamlit text_area only every 5 logs
-    - Reduces rerender overhead massively
-
-    You can safely replace log_append() calls with fast_log() in loops.
-    """
-
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    logs.append(f"[{ts}] {msg}")
-
-    # Update UI every 5 logs only → huge speed improvement
-    if len(logs) % 5 == 0:
-        try:
-            log_placeholder.text_area(
-                "Logs",
-                value="\n".join(logs[-2000:]),   # limit to last 2000 lines
-                height=360
-            )
-        except Exception:
-            pass
 #-------------------------------------------------------------------
 
 def _apify_headers(token: str) -> dict:
@@ -1840,6 +1730,14 @@ def main_ui():
             st.sidebar.error(f"Validation failed: {msg}")
             st.session_state["logs"].append("[UI] API token validation failed.")
 
+    # ✅ NEW: Reset button in sidebar
+    if st.sidebar.button("🔄 Reset & Clear Cache"):
+        # Create a temporary directory path for reset
+        tmp_dir = tempfile.gettempdir()
+        ui_reset_state(tmp_dir)
+        st.sidebar.success("Cache cleared! Ready for new file.")
+        st.rerun()
+
     # logs area (neat box)
     log_placeholder = st.empty()
     current_logs = "\n".join(st.session_state["logs"][-2000:])
@@ -1883,7 +1781,6 @@ def main_ui():
                     st.error("Processing failed. Check logs for details.")
     else:
         st.info("Please validate your API key in the sidebar before uploading files.")
-
 
 if __name__ == "__main__":
     main_ui()
