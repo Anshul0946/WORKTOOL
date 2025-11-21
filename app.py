@@ -1341,6 +1341,7 @@ def process_file_streamlit(user_file_path: str,
             "avearge": avearge,
         }
 
+        attempted_expressions = set()
         problematic_cells = []
         for row in sheet_r3.iter_rows(min_row=1, max_row=sheet_r3.max_row, min_col=1, max_col=16):
             for cell in row:
@@ -1358,6 +1359,8 @@ def process_file_streamlit(user_file_path: str,
             # find a candidate expression from extract_text that references a known base var
             candidate = None
             for ex in extract_text:
+                if ex in attempted_expressions:
+                    continue
                 mm = re.match(r"^([A-Za-z_]\w*)", ex.strip())
                 if not mm:
                     continue
@@ -1371,6 +1374,7 @@ def process_file_streamlit(user_file_path: str,
                 continue
 
             expr = candidate
+            attempted_expressions.add(expr)
             log_append(text_area_placeholder, logs, f"[RULE3] Attempting strict re-map '{expr}' for cell {cell.coordinate}")
             m = re.match(r"^([A-Za-z_]\w*)(.*)$", expr)
             if not m:
