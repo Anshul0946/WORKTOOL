@@ -1170,163 +1170,137 @@ def process_file_streamlit(user_file_path: str,
 
 def _retry_image_and_merge(image_name: str, sector_var_map: dict, token: str, model_generic_local: str, temp_dir: str, text_area_placeholder, logs: list) -> bool:
     """
-    SAFEST version of retry logic.
-    - Prevents .items() crashes
-    - Handles None outputs
-    - Handles invalid or empty 'data'
-    - Searches all image directories
-    - Respects retried_images set
-    - Logs all steps clearly
+    Robust retry logic that uses the enclosing process_file_streamlit locals (images_by_sector, retried_images).
+    IMPORTANT: This function relies on being *nested inside* process_file_streamlit so it can read/write:
+      - images_by_sector (list mapping)
+      - retried_images (set)
+    It uses the passed temp_dir parameter to find extracted images quickly.
+    Returns True if any useful data was merged, False otherwise.
     """
+    # Defensive: ensure the outer locals we need exist
+    try:
+        # images_by_sector and retried_images are expected in the outer scope (process_file_streamlit)
+        images_map = images_by_sector
+    except NameError:
+        log_append(text_area_placeholder, logs, f"[EVAL ERROR] images_by_sector not visible to retry for {image_name}.")
+        return False
 
-    # -----------------------------
-    # Locate image path (Fix applied: prefer local temp_dir)
-    # -----------------------------
+    try:
+        # Use the retried_images set from outer scope
+        outer_retried = retried_images
+    except NameError:
+        # If it doesn't exist, create one in outer scope (rare)
+        try:
+            globals().setdefault("retried_images", set())
+            outer_retried = globals()["retried_images"]
+        except Exception:
+            outer_retried = set()
+
+    # Build images temp folder from passed temp_dir (simple and reliable)
     images_temp_path = None
     try:
-        # Check if temp_dir is defined in local scope or global scope
-        if "temp_dir" in locals() and locals().get("temp_dir"):
-            images_temp_path = os.path.join(locals().get("temp_dir"), "images")
-        elif "temp_dir" in globals() and globals().get("temp_dir"):
-            images_temp_path = os.path.join(globals().get("temp_dir"), "images")
+        if temp_dir:
+            images_temp_path = os.path.join(temp_dir, "images")
     except Exception:
         images_temp_path = None
 
+    # 1) try direct image in temp folder
     image_path = None
-
-    # First: temp folder
     if images_temp_path:
         candidate = os.path.join(images_temp_path, f"{image_name}.png")
         if os.path.exists(candidate):
             image_path = candidate
 
-    # Second: search in images_by_sector (Assumes images_by_sector is a global variable)
-    if not image_path and "images_by_sector" in globals():
-        found_path = None
-        for sector_list in globals()["images_by_sector"].values():
-            for p in sector_list:
+    # 2) fallback: search images_by_sector (use the actual local variable)
+    if not image_path:
+        found = None
+        for lst in images_map.values():
+            for p in lst:
                 try:
                     if Path(p).stem == image_name:
-                        found_path = p
+                        found = p
                         break
                 except Exception:
                     continue
-            if found_path:
+            if found:
                 break
-        if found_path:
-            image_path = found_path
+        if found:
+            image_path = found
 
-    # If STILL not found -> skip
     if not image_path:
-        log_append(text_area_placeholder, logs,
-                   f"[EVAL WARN] Image '{image_name}' not found for retry.")
+        log_append(text_area_placeholder, logs, f"[EVAL WARN] Image {image_name} not found for retry.")
         return False
 
-    # Prevent multiple retries of same physical file (Assumes retried_images is a global set)
-    normalized_path = os.path.abspath(image_path)
-    
-    if "retried_images" in globals() and normalized_path in globals()["retried_images"]:
-        log_append(text_area_placeholder, logs,
-                   f"[EVAL] Already retried '{image_name}'. Skipping.")
+    normalized = os.path.abspath(image_path)
+    if normalized in outer_retried:
+        log_append(text_area_placeholder, logs, f"[EVAL] Already retried {image_name}. Skipping.")
         return False
-    
-    if "retried_images" in globals():
-        globals()["retried_images"].add(normalized_path)
+
+    # mark retried
+    outer_retried.add(normalized)
 
     is_voice = image_name.lower().startswith("voicetest")
-    log_append(text_area_placeholder, logs,
-               f"[EVAL] Retrying '{image_name}' at {image_path}")
+    log_append(text_area_placeholder, logs, f"[EVAL] Attempting normal analyze for {image_name} (path={image_path}).")
 
-    # -----------------------------
-    # STEP 1: NORMAL ANALYZE
-    # -----------------------------
+    # Call analyze (guarded)
+    normal_res = None
     try:
         if is_voice:
-            normal_res = analyze_voice_image(
-                token, image_path, model_generic_local,
-                text_area_placeholder, logs
-            )
+            normal_res = analyze_voice_image(token, image_path, model_generic_local, text_area_placeholder, logs)
         else:
-            normal_res = analyze_generic_image(
-                token, image_path, model_generic_local,
-                text_area_placeholder, logs
-            )
+            normal_res = analyze_generic_image(token, image_path, model_generic_local, text_area_placeholder, logs)
     except Exception as e:
-        log_append(text_area_placeholder, logs,
-                   f"[EVAL ERROR] Normal analyze crashed for '{image_name}': {e}")
+        log_append(text_area_placeholder, logs, f"[EVAL ERROR] analyze crashed for {image_name}: {e}")
         normal_res = None
 
-    # If result is valid JSON -> merge
+    # If usable -> merge
     if normal_res and is_valid_generic_result(normal_res):
         data = safe_get_data(normal_res)
-        safe_merge_into_map(sector_var_map, image_name, data,
-                            text_area_placeholder, logs)
-        log_append(text_area_placeholder, logs,
-                   f"[EVAL] Normal retry SUCCESS for '{image_name}'.")
+        safe_merge_into_map(sector_var_map, image_name, data, text_area_placeholder, logs)
+        log_append(text_area_placeholder, logs, f"[EVAL] Normal analyze produced usable data for {image_name}. Merged.")
         return True
 
-    # If image_type exists but data missing -> salvage
+    # Salvage partial if image_type present and data dict salvageable
     if isinstance(normal_res, dict):
         img_type = normal_res.get("image_type")
         if isinstance(img_type, str) and img_type.lower() in {"speed_test", "video_test", "voice_call"}:
             data = safe_get_data(normal_res)
             if data:
-                safe_merge_into_map(sector_var_map, image_name, data,
-                                    text_area_placeholder, logs)
-                log_append(text_area_placeholder, logs,
-                           f"[EVAL] Salvaged partial data from normal retry for '{image_name}'.")
+                safe_merge_into_map(sector_var_map, image_name, data, text_area_placeholder, logs)
+                log_append(text_area_placeholder, logs, f"[EVAL] Salvaged partial data from normal analyze for {image_name}.")
                 return True
 
-    # -----------------------------
-    # STEP 2: CAREFUL EVALUATION
-    # -----------------------------
-    log_append(text_area_placeholder, logs,
-               f"[EVAL] Normal retry failed. Running careful evaluation for '{image_name}'.")
-
+    # Normal analyze failed, try careful evaluation
+    log_append(text_area_placeholder, logs, f"[EVAL] Normal analyze didn't help for {image_name}. Trying careful evaluation.")
+    eval_res = None
     try:
         if is_voice:
-            eval_res = evaluate_voice_image(
-                token, image_path, model_generic_local,
-                text_area_placeholder, logs
-            )
+            eval_res = evaluate_voice_image(token, image_path, model_generic_local, text_area_placeholder, logs)
         else:
-            eval_res = evaluate_generic_image(
-                token, image_path, model_generic_local,
-                text_area_placeholder, logs
-            )
+            eval_res = evaluate_generic_image(token, image_path, model_generic_local, text_area_placeholder, logs)
     except Exception as e:
-        log_append(text_area_placeholder, logs,
-                   f"[EVAL ERROR] Careful evaluation crashed for '{image_name}': {e}")
+        log_append(text_area_placeholder, logs, f"[EVAL ERROR] careful evaluate failed for {image_name}: {e}")
         eval_res = None
 
-    # No result
     if not eval_res:
-        log_append(text_area_placeholder, logs,
-                   f"[EVAL] Careful evaluation returned nothing for '{image_name}'.")
+        log_append(text_area_placeholder, logs, f"[EVAL] Careful evaluation returned nothing for {image_name}.")
         return False
 
-    # Valid structured result
     if is_valid_generic_result(eval_res):
         data = safe_get_data(eval_res)
-        safe_merge_into_map(sector_var_map, image_name, data,
-                            text_area_placeholder, logs)
-        log_append(text_area_placeholder, logs,
-                   f"[EVAL] Careful retry SUCCESS for '{image_name}'.")
+        safe_merge_into_map(sector_var_map, image_name, data, text_area_placeholder, logs)
+        log_append(text_area_placeholder, logs, f"[EVAL] Careful evaluation produced usable data for {image_name}. Merged.")
         return True
 
-    # Invalid structure but contains data dict
-    if isinstance(eval_res, dict) and isinstance(eval_res.get("data"), dict):
-        data = eval_res.get("data", {})
-        safe_merge_into_map(sector_var_map, image_name, data,
-                            text_area_placeholder, logs)
-        log_append(text_area_placeholder, logs,
-                   f"[EVAL] Careful eval returned partial usable data for '{image_name}'. Merged.")
+    # if eval_res has a 'data' dict but nonstandard structure, still try to merge
+    if isinstance(eval_res, dict) and isinstance(eval_res.get("data"), dict) and eval_res.get("data"):
+        safe_merge_into_map(sector_var_map, image_name, eval_res.get("data", {}), text_area_placeholder, logs)
+        log_append(text_area_placeholder, logs, f"[EVAL] Careful evaluation returned partial data for {image_name}. Merged.")
         return True
 
-    # Nothing usable
-    log_append(text_area_placeholder, logs,
-               f"[EVAL] No usable data found for '{image_name}' after all retries.")
+    log_append(text_area_placeholder, logs, f"[EVAL] Careful evaluation produced no usable data for {image_name}.")
     return False
+
 
 
 
