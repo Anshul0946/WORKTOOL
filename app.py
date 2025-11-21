@@ -1724,7 +1724,7 @@ def main_ui():
     st.markdown(
         """
         <div style='text-align: center; color: #666; font-size: 0.85em; padding: 10px;'>
-            Made with ❤️ by <b>Akshatha Kallur</b> 🚀✨
+            Made by <b>Akshatha Kallur</b> 🚀✨
         </div>
         """,
         unsafe_allow_html=True
