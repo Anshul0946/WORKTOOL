@@ -24,8 +24,8 @@ from PIL import Image
 
 # ---------------- Configuration ----------------
 API_BASE = "https://openrouter.apify.actor/api/v1"
-MODEL_SERVICE_DEFAULT = "google/gemini-2.5-pro"
-MODEL_GENERIC_DEFAULT = "google/gemini-2.5-flash"
+MODEL_SERVICE_DEFAULT = "x-ai/grok-4.1-fast"
+MODEL_GENERIC_DEFAULT = "x-ai/grok-4.1-fast"
 
 # ---------------- Schemas ----------------
 SERVICE_SCHEMA = {
