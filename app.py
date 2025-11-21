@@ -183,7 +183,6 @@ def safe_merge_into_map(sector_map, image_name, data, log_placeholder, logs):
             target[k] = v
 
 #--------------------------------------------------
-
 def clear_processing_cache(temp_dir: str, keep_api_token: bool = True):
     """
     Clears temp folders and resets all processing globals.
@@ -199,18 +198,22 @@ def clear_processing_cache(temp_dir: str, keep_api_token: bool = True):
         saved_token = st.session_state["APIFY_TOKEN"]
 
     # ----------------------------
-    # Delete temp directory
+    # Delete ONLY user-created temp directories (not system /tmp)
     # ----------------------------
     try:
-        if os.path.exists(temp_dir):
+        # Only delete if it's a streamlit-created temp directory
+        if os.path.exists(temp_dir) and "streamlit_" in temp_dir:
             shutil.rmtree(temp_dir)
+            if "logs" in st.session_state:
+                st.session_state["logs"].append(f"[CACHE CLEAR] Removed temp directory: {temp_dir}")
+        elif os.path.exists(temp_dir) and temp_dir != "/tmp":
+            # Safe to delete if it's not the system temp folder
+            shutil.rmtree(temp_dir)
+            if "logs" in st.session_state:
+                st.session_state["logs"].append(f"[CACHE CLEAR] Removed temp directory: {temp_dir}")
     except Exception as e:
         if "logs" in st.session_state:
-            st.session_state["logs"].append(
-                f"[CACHE CLEAR] Could not remove temp dir {temp_dir}: {e}"
-            )
-        else:
-            print(f"[CACHE CLEAR] Could not remove temp dir {temp_dir}: {e}")
+            st.session_state["logs"].append(f"[CACHE CLEAR] Could not remove temp dir {temp_dir}: {e}")
 
     # ----------------------------
     # Reset processing globals with CORRECT TYPES
@@ -226,9 +229,9 @@ def clear_processing_cache(temp_dir: str, keep_api_token: bool = True):
         "beta_video": {},
         "gamma_video": {},
         "voice_test": {},
-        "extract_text": [],       # Must be list
-        "avearge": {},            # Dict
-        "retried_images": set()   # Must be set
+        "extract_text": [],
+        "avearge": {},
+        "retried_images": set()
     }
 
     for var_name, default_value in type_defaults.items():
@@ -254,27 +257,25 @@ def clear_processing_cache(temp_dir: str, keep_api_token: bool = True):
     # Log result
     # ----------------------------
     if "logs" in st.session_state:
-        st.session_state["logs"].append(
-            "[CACHE CLEAR] Processing cache cleared. Token preserved."
-        )
-    else:
-        print("[CACHE CLEAR] Processing cache cleared. Token preserved.")
+        st.session_state["logs"].append("[CACHE CLEAR] Processing cache cleared. Token preserved.")
 
 #---------------------------------------------------------------
 def ui_reset_state(temp_dir: str):
     """
     Clears all processing state while PRESERVING the API key.
-    This is triggered by a 'Reset' or 'Start Over' button in the UI.
+    This is triggered by the 'Reset' button in the UI.
 
     What it does:
     - Clears logs
     - Removes temp image directory
     - Resets global dicts (speedtest / service / video / voice)
+    - Clears uploaded file from UI
     - Preserves st.session_state['APIFY_TOKEN']
     """
 
     # Save API key before clearing anything
     saved_token = st.session_state.get("APIFY_TOKEN", None)
+    saved_api_valid = st.session_state.get("API_VALID", False)
 
     # Reset logs
     st.session_state["logs"] = ["[UI] Processor reset. Ready for new file."]
@@ -282,12 +283,20 @@ def ui_reset_state(temp_dir: str):
     # Clear cached processing data
     clear_processing_cache(temp_dir, keep_api_token=True)
 
-    # Restore token (safety)
+    # Clear the file uploader by resetting its key
+    if "file_uploader_key" not in st.session_state:
+        st.session_state["file_uploader_key"] = 0
+    st.session_state["file_uploader_key"] += 1
+
+    # Restore token and validation status
     if saved_token:
         st.session_state["APIFY_TOKEN"] = saved_token
+    if saved_api_valid:
+        st.session_state["API_VALID"] = saved_api_valid
 
     # Add confirmation log
-    st.session_state["logs"].append("[UI] All caches cleared (token preserved).")
+    st.session_state["logs"].append("[UI] All caches cleared. File uploader reset. Token preserved.")
+
 #--------------------------------------------------------------------------------
 
 #-------------------------------------------------------------------
@@ -1593,61 +1602,99 @@ def main_ui():
     st.title("Advanced Cellular Template Processor")
     st.write("Provide an API key in the sidebar and validate it. After validation you can upload an .xlsx template.")
 
-    # sidebar: token & simple validation
-    st.sidebar.header("API Key & Settings")
-    token_input = st.sidebar.text_input("Apify/OpenRouter API token", type="password", placeholder="apify_api_...")
+    # Initialize session state variables
     if "logs" not in st.session_state:
         st.session_state["logs"] = []
     if "API_VALID" not in st.session_state:
         st.session_state["API_VALID"] = False
     if "APIFY_TOKEN" not in st.session_state:
         st.session_state["APIFY_TOKEN"] = ""
+    if "file_uploader_key" not in st.session_state:
+        st.session_state["file_uploader_key"] = 0
 
+    # ==================== SIDEBAR ====================
+    st.sidebar.header("API Key & Settings")
+    
+    # API Key Input
+    token_input = st.sidebar.text_input(
+        "Apify/OpenRouter API token", 
+        type="password", 
+        placeholder="apify_api_..."
+    )
+
+    # Validate API Key Button
     if st.sidebar.button("Validate API key"):
         ok, msg = validate_api_key(token_input)
         if ok:
             st.session_state["API_VALID"] = True
             st.session_state["APIFY_TOKEN"] = token_input
-            st.sidebar.success("API token stored in session (format validated).")
+            st.sidebar.success("✅ API token validated and stored.")
             st.session_state["logs"].append("[UI] API token stored (format validated).")
         else:
             st.session_state["API_VALID"] = False
-            st.sidebar.error(f"Validation failed: {msg}")
+            st.sidebar.error(f"❌ Validation failed: {msg}")
             st.session_state["logs"].append("[UI] API token validation failed.")
 
-    # ✅ NEW: Reset button in sidebar
+    st.sidebar.markdown("---")
+
+    # Reset & Clear Cache Button
     if st.sidebar.button("🔄 Reset & Clear Cache"):
-        # Create a temporary directory path for reset
-        tmp_dir = tempfile.gettempdir()
+        # Get temp directory from session or use system temp
+        tmp_dir = st.session_state.get("current_temp_dir", tempfile.gettempdir())
         ui_reset_state(tmp_dir)
-        st.sidebar.success("Cache cleared! Ready for new file.")
+        st.sidebar.success("✅ Cache cleared! Upload a new file to start fresh.")
         st.rerun()
 
-    # logs area (neat box)
+    # ==================== LOGS AREA ====================
     log_placeholder = st.empty()
     current_logs = "\n".join(st.session_state["logs"][-2000:])
-    log_placeholder.text_area("Logs", value=current_logs, height=360)
+    log_placeholder.text_area("Processing Logs", value=current_logs, height=360)
 
-    # only allow uploading when validated
+    # ==================== MAIN CONTENT ====================
     if st.session_state.get("API_VALID", False):
-        st.header("Upload Template (.xlsx only)")
-        uploaded_file = st.file_uploader("Upload .xlsx template", type=["xlsx"], accept_multiple_files=False)
+        st.header("📁 Upload Template (.xlsx only)")
+        
+        # File uploader with dynamic key for reset functionality
+        uploaded_file = st.file_uploader(
+            "Upload .xlsx template", 
+            type=["xlsx"], 
+            accept_multiple_files=False,
+            key=f"file_uploader_{st.session_state['file_uploader_key']}"
+        )
 
-        model_service = st.selectbox("Model for SERVICE images", options=[MODEL_SERVICE_DEFAULT], index=0)
-        model_generic = st.selectbox("Model for GENERIC images", options=[MODEL_GENERIC_DEFAULT], index=0)
+        # Model Selection
+        col1, col2 = st.columns(2)
+        with col1:
+            model_service = st.selectbox(
+                "Model for SERVICE images", 
+                options=[MODEL_SERVICE_DEFAULT], 
+                index=0
+            )
+        with col2:
+            model_generic = st.selectbox(
+                "Model for GENERIC images", 
+                options=[MODEL_GENERIC_DEFAULT], 
+                index=0
+            )
 
         if uploaded_file:
-            # use a unique temporary directory to avoid collisions
+            # Create unique temporary directory
             tmp_dir = tempfile.mkdtemp(prefix="streamlit_")
+            st.session_state["current_temp_dir"] = tmp_dir  # Store for reset
+            
             saved_template_path = os.path.join(tmp_dir, uploaded_file.name)
             with open(saved_template_path, "wb") as f:
                 f.write(uploaded_file.read())
-            st.success(f"Saved uploaded file: {uploaded_file.name}")
-            st.info("Temporary directory created for this upload (isolated).")
+            
+            st.success(f"✅ File uploaded: **{uploaded_file.name}**")
+            st.info(f"📂 Temporary directory: `{tmp_dir}`")
 
-            if st.button("Process file now"):
+            # Process File Button
+            if st.button("▶️ Process File Now", type="primary"):
                 st.session_state["logs"].append("[UI] Starting processing...")
                 log_append(log_placeholder, st.session_state["logs"], "[UI] Starting processing...")
+                
+                # Process the file
                 out_path = process_file_streamlit(
                     user_file_path=saved_template_path,
                     token=st.session_state["APIFY_TOKEN"],
@@ -1659,13 +1706,30 @@ def main_ui():
                 )
 
                 if out_path:
-                    st.success("Processing finished.")
+                    st.success("✅ Processing finished successfully!")
                     with open(out_path, "rb") as f:
-                        st.download_button("Download processed file", data=f, file_name=os.path.basename(out_path))
+                        st.download_button(
+                            label="📥 Download Processed File",
+                            data=f,
+                            file_name=os.path.basename(out_path),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
                 else:
-                    st.error("Processing failed. Check logs for details.")
+                    st.error("❌ Processing failed. Check logs for details.")
     else:
-        st.info("Please validate your API key in the sidebar before uploading files.")
+        st.info("🔑 Please validate your API key in the sidebar before uploading files.")
+
+    # ==================== FOOTER ====================
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style='text-align: center; color: #666; font-size: 0.85em; padding: 10px;'>
+            Made with ❤️ by <b>Akshatha Kallur</b> 🚀✨
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
 
 if __name__ == "__main__":
     main_ui()
