@@ -1595,10 +1595,12 @@ def process_file_streamlit(user_file_path: str,
 
 # ---------------- Streamlit UI ----------------
 def validate_api_key(token: str) -> Tuple[bool, str]:
-    # lightweight format check
-    if not token or "apify_api" not in token:
-        return False, "Token does not look like an Apify token (missing 'apify_api')."
-    return True, "Token looks valid (format check)."
+    # Basic check for NVIDIA / generic API keys
+    if not token or len(token.strip()) < 20:
+        return False, "Token looks invalid (too short or empty)."
+
+    return True, "Token format accepted."
+
 
 
 def main_ui():
