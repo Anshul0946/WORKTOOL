@@ -118,6 +118,88 @@ def is_valid_generic_result(result):
 
     return True
 
+def verify_parsed_json(parsed: dict, schema: dict) -> dict:
+    """
+    Lightweight verification of a parsed per-image JSON.
+    Returns {'ok': bool, 'issues': [...], 'normalized': {...}}.
+    """
+    issues = []
+    normalized = {}
+    for k in schema.keys():
+        v = parsed.get(k) if isinstance(parsed, dict) else None
+        if v is None:
+            normalized[k] = None
+            continue
+        if k in ('nr5g_rsrp','nr5g_rsrq','nr5g_sinr','lte_rsrp','lte_rsrq','lte_sinr','nr_bw','lte_bw'):
+            try:
+                n = _normalize_num(v)
+                if n is None:
+                    issues.append(f"could_not_parse_numeric:{k}:{v}")
+                    normalized[k] = None
+                else:
+                    normalized[k] = n
+            except Exception:
+                normalized[k] = None
+                issues.append(f"error_parse_numeric:{k}")
+            continue
+        if k in ('nr_pci','lte_pci','nr_arfcn','lte_earfcn'):
+            s = str(v).strip()
+            if s.isdigit():
+                normalized[k] = int(s)
+            else:
+                normalized[k] = None
+                issues.append(f"id_non_numeric:{k}:{v}")
+            continue
+        normalized[k] = v
+    ok = len(issues) == 0
+    return {'ok': ok, 'issues': issues, 'normalized': normalized}
+
+def normalize_and_validate_service(res: dict) -> dict:
+    """
+    Ensure output types are clean and stable before writing to tables.
+    """
+    out = {}
+    for k in SERVICE_SCHEMA.keys():
+        v = res.get(k) if isinstance(res, dict) else None
+        if v is None:
+            out[k] = None
+            continue
+        if k in ('nr5g_rsrp','nr5g_rsrq','nr5g_sinr','lte_rsrp','lte_rsrq','lte_sinr','nr_bw','lte_bw'):
+            out[k] = _normalize_num(v)
+        elif k in ('nr_pci','lte_pci','nr_arfcn','lte_earfcn'):
+            try:
+                out[k] = int(str(v).strip()) if str(v).strip().isdigit() else None
+            except Exception:
+                out[k] = None
+        else:
+            out[k] = v
+    out['misc'] = res.get('misc', {}) if isinstance(res, dict) else {}
+    if '_meta' in res:
+        out['_meta'] = res['_meta']
+    if '_provenance' in res:
+        out['_provenance'] = res['_provenance']
+    return out
+
+import threading
+_write_lock = threading.Lock()
+
+def safe_write_output(target_path: str, data: dict):
+    try:
+        with _write_lock:
+            import json
+            with open(target_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def assign_to_sector(output_map: dict, sector: str, key: str, value):
+    if sector not in output_map or not isinstance(output_map[sector], dict):
+        output_map[sector] = {}
+    if key in output_map[sector] and output_map[sector][key] is not None and value is not None:
+        return False
+    output_map[sector][key] = value
+    return True
 
 def safe_get_data(result):
     """
@@ -827,103 +909,41 @@ def evaluate_voice_image(token: str, image_path: str, model_name: str, log_place
     return analyze_voice_image(token, image_path, model_name, log_placeholder, logs)
 
 # ---------------- Careful evaluation functions ----------------
-def evaluate_service_images(token: str, image1_path: str, image2_path: str, model_name: str, log_placeholder, logs: list) -> Optional[dict]:
-    """
-    Careful evaluation that no longer sends two images in one request.
-    Instead:
-      1) Analyze each service image separately (analyze_service_single)
-      2) If deterministic merging still has unresolved fields, send TEXT-ONLY reconciliation prompt
-         (SCHEMA + res1 + res2) to the model and parse JSON response.
-    Returns reconciled dict or None.
-    """
-    sector = Path(image1_path).stem.split("_")[0] if image1_path else "unknown"
-    log_append(log_placeholder, logs, f"[EVAL] Re-evaluating service images for '{sector}' (careful, text-only reconciliation)")
-
-    # 1) Extract per-image JSONs using existing analyzer (single-image vision calls)
+def evaluate_service_images(token: str, image1_path: str, image2_path: str, model_name: str, log_placeholder, logs: list) -> dict:
+    sector = Path(image1_path).stem.split("_")[0] if image1_path else (Path(image2_path).stem.split("_")[0] if image2_path else 'unknown')
+    log_append(log_placeholder, logs, f"[EVAL] Re-evaluating service images for '{sector}' (careful, patched)")
+    # 1) per-image extract
     try:
         res1 = analyze_service_single(token, image1_path, model_name, log_placeholder, logs) if image1_path else {}
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[EVAL ERROR] analyze_service_single image1 failed: {e}")
+        res1 = {}
+    try:
         res2 = analyze_service_single(token, image2_path, model_name, log_placeholder, logs) if image2_path else {}
     except Exception as e:
-        log_append(log_placeholder, logs, f"[EVAL ERROR] Failed per-image analysis: {e}")
-        return None
-
-    if not isinstance(res1, dict):
-        res1 = {}
-    if not isinstance(res2, dict):
+        log_append(log_placeholder, logs, f"[EVAL ERROR] analyze_service_single image2 failed: {e}")
         res2 = {}
-
-    # quick sanity: if both are empty, nothing to do
+    res1 = res1 if isinstance(res1, dict) else {}
+    res2 = res2 if isinstance(res2, dict) else {}
     if not res1 and not res2:
-        log_append(log_placeholder, logs, "[EVAL] Both per-image analyses returned empty. Skipping reconciliation.")
+        log_append(log_placeholder, logs, "[EVAL] Both per-image analyses empty; returning None")
         return None
-
-    # 2) Attempt deterministic merge first (reuse existing logic)
-    merged_det = merge_service_responses(token, res1, res2, SERVICE_SCHEMA, model_name, log_placeholder, logs)
-    # If deterministic merge succeeded without unresolved conflicts, return it
-    # merge_service_responses sets _meta/_provenance and logs accordingly
-    unresolved_flag = False
-    try:
-        meta_decisions = merged_det.get("_meta", {}).get("decisions", {})
-        # if any decision has reason indicating conflict or chosen None when both v1 and v2 present -> unresolved
-        for k, d in (meta_decisions.items() if isinstance(meta_decisions, dict) else []):
-            reason = d.get("reason")
-            chosen = d.get("chosen")
-            v1 = d.get("v1")
-            v2 = d.get("v2")
-            if reason in ("conflict_ids", "bw_large_diff_conflict") or (chosen is None and (v1 is not None and v2 is not None)):
-                unresolved_flag = True
-                break
-    except Exception:
-        unresolved_flag = True
-
-    if not unresolved_flag:
-        log_append(log_placeholder, logs, "[EVAL] Deterministic merge returned a complete result; returning.")
-        return merged_det
-
-    # 3) Unresolved -> call text-only reconciliation model prompt (no images)
-    log_append(log_placeholder, logs, "[EVAL] Deterministic rules left conflicts — calling text-only model to reconcile JSONs.")
-
-    recon_prompt = (
-        "You are a senior radio network engineer. Reconcile the two extracted JSONs into one authoritative JSON "
-        "that matches the SCHEMA exactly. For each field return the chosen value (or null) and populate a 'meta' object "
-        "containing v1, v2, chosen, reason (short telecom justification), and confidence (0-1). Use deterministic telecom "
-        "logic: RSRP/RSRQ/SINR ranges and preferences, PCI/ARFCN exactness, RAT separation (NR vs LTE). Do not invent values.\n\n"
-        f"SCHEMA:\n{json.dumps(SERVICE_SCHEMA, indent=2)}\n\n"
-        f"RES1:\n{json.dumps(res1, indent=2)}\n\n"
-        f"RES2:\n{json.dumps(res2, indent=2)}\n\n"
-        "Return EXACTLY one JSON object that contains schema fields, 'meta', and keep a '_provenance' block with res1/res2. "
-        "Return no explanation outside the JSON."
-    )
-
-    payload = {
-        "model": model_name,
-        "messages": [{"role": "user", "content": [{"type": "text", "text": recon_prompt}]}],
-        "response_format": {"type": "json_object"},
-    }
-
-    try:
-        resp = _post_chat_completion(token, payload, timeout=90)
-        try:
-            resp.raise_for_status()
-        except Exception as e:
-            # log response text if available
-            log_append(log_placeholder, logs, f"[EVAL ERROR] Reconciliation call failed: {e}. Response text: {getattr(resp, 'text', '')}")
-            return None
-
-        content = _extract_response_content(resp, log_placeholder, logs)
-        content = clean_json_response(content)
-        reconciled = json.loads(content)
-        reconciled["_provenance"] = {"res1": res1, "res2": res2}
-        log_append(log_placeholder, logs, "[EVAL] Model reconciliation successful.")
-        return reconciled
-    except Exception as e:
-        log_append(log_placeholder, logs, f"[EVAL ERROR] Service evaluation failed: {e}")
-        if 'resp' in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')}")
-        return None
-    finally:
-        log_append(log_placeholder, logs, "[EVAL] Cooldown: waiting 2 seconds")
-        time.sleep(2)
+    v1 = verify_parsed_json(res1, SERVICE_SCHEMA)
+    v2 = verify_parsed_json(res2, SERVICE_SCHEMA)
+    log_append(log_placeholder, logs, f"[EVAL] image1 verification: ok={v1['ok']} issues={v1['issues']}")
+    log_append(log_placeholder, logs, f"[EVAL] image2 verification: ok={v2['ok']} issues={v2['issues']}")
+    merged = merge_service_responses(token, res1, res2, SERVICE_SCHEMA, model_name, log_placeholder, logs)
+    normalized = normalize_and_validate_service(merged)
+    if '_meta' in merged:
+        low_conf = []
+        for k, d in merged['_meta'].get('decisions', {}).items():
+            conf = d.get('confidence') if isinstance(d, dict) else None
+            if conf is None:
+                if d.get('chosen') is None and (d.get('v1') is not None or d.get('v2') is not None):
+                    low_conf.append(k)
+        if low_conf:
+            log_append(log_placeholder, logs, f"[EVAL] Fields flagged low-confidence: {low_conf}")
+    return normalized
 
 
 def evaluate_generic_image(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> Optional[dict]:
