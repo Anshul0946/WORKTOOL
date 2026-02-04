@@ -421,20 +421,89 @@ def get_sector_from_col(col_index: int) -> str:
 
 def clean_json_response(content: str) -> str:
     """
-    Strip markdown fences and whitespace around JSON-ish responses.
+    Extract JSON object/array from noisy model output.
     """
+
     if not content:
-        return content
-    content = str(content).strip()
-    # remove ```json or ``` wrappers
-    if content.startswith("```"):
-        content = re.sub(r'^```(?:json)?\s*', '', content)
-        content = re.sub(r'\s*```$', '', content)
-    # sometimes the assistant returns text with leading explanation then JSON block - try to find JSON object
-    m = re.search(r"(\{[\s\S]*\})", content)
-    if m:
-        return m.group(1).strip()
-    return content.strip()
+        return content or ""
+
+    s = str(content).strip()
+
+    # Remove ```json blocks
+    if s.startswith("```"):
+        s = re.sub(r'^```(?:json)?\s*', '', s, flags=re.IGNORECASE).strip()
+        s = re.sub(r'\s*```$', '', s).strip()
+
+    # Try extract JSON object
+    obj = re.search(r'(\{[\s\S]*\})', s)
+    arr = re.search(r'(\[[\s\S]*\])', s)
+
+    if obj:
+        return obj.group(1).strip()
+
+    if arr:
+        return arr.group(1).strip()
+
+    return s
+
+def safe_post_chat_completion(token: str,
+                              payload: dict,
+                              timeout: int = 60,
+                              retries: int = 3,
+                              backoff: float = 1.0,
+                              log_placeholder=None,
+                              logs=None):
+    """
+    Calls _post_chat_completion with retry.
+    Timeout doubles every retry.
+    """
+
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+
+        current_timeout = int(timeout * (2 ** (attempt - 1)))
+
+        try:
+            resp = _post_chat_completion(
+                token,
+                payload,
+                timeout=current_timeout
+            )
+            return resp
+
+        except Exception as e:
+
+            last_error = e
+
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            msg = f"[API-RETRY] attempt {attempt}/{retries} failed (timeout={current_timeout}s): {repr(e)}"
+
+            if logs is not None:
+                logs.append(f"[{ts}] {msg}")
+
+            try:
+                if log_placeholder is not None:
+                    log_placeholder.text_area(
+                        "Logs",
+                        value="\n".join(logs[-2000:]),
+                        height=360
+                    )
+            except Exception:
+                pass
+
+            if attempt == retries:
+                break
+
+            sleep_time = backoff * (2 ** (attempt - 1)) + (0.05 * attempt)
+            time.sleep(sleep_time)
+
+    if logs is not None:
+        logs.append(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [API-RETRY] ALL retries failed: {repr(last_error)}"
+        )
+
+    return None
 
 # ---------------- Image extraction (only .xlsx now) ----------------
 def extract_images_from_excel(xlsx_path: str, output_folder: str, log_placeholder, logs: list) -> List[str]:
@@ -511,56 +580,64 @@ def _post_chat_completion(token: str, payload: dict, timeout: int = 60, max_retr
     # re-raise
     raise last_exc
 
-def _extract_response_content(resp, log_placeholder, logs: list) -> str:
+def _extract_response_content(resp, log_placeholder=None, logs=None) -> str:
     """
-    Safely extract the model assistant content from a response.
-    If the HTTP body is JSON with choices -> return choices[0].message.content
-    Otherwise return resp.text as fallback (and log it).
+    Safely extract assistant content from API response.
+    Never throws. Returns string.
     """
+    if resp is None:
+        return ""
+
+    # Try JSON first
     try:
         j = resp.json()
+
+        if isinstance(j, dict):
+            choices = j.get("choices")
+
+            if isinstance(choices, list) and len(choices) > 0:
+                msg = choices[0].get("message", {}).get("content")
+
+                if isinstance(msg, (dict, list)):
+                    return json.dumps(msg, ensure_ascii=False)
+
+                if isinstance(msg, str):
+                    return msg
+
+            if "content" in j:
+                c = j["content"]
+                if isinstance(c, str):
+                    return c
+                return json.dumps(c, ensure_ascii=False)
+
     except Exception:
-        log_append(log_placeholder, logs, f"[DEBUG] Non-JSON response body (first 2000 chars):\n{getattr(resp, 'text', '')[:2000]}")
-        return getattr(resp, 'text', '')
-    # Extract common assistant path
+        pass
+
+    # Fallback: raw text
     try:
-        choices = j.get("choices")
-        if choices and isinstance(choices, list) and len(choices) > 0:
-            choice0 = choices[0]
-            # compatible with several provider shapes
-            message = choice0.get("message") if isinstance(choice0, dict) else None
-            if isinstance(message, dict):
-                content = message.get("content")
-                if isinstance(content, dict):
-                    return json.dumps(content)
-                return content if content is not None else json.dumps(j)
-            # older shape: choice0.get("text")
-            text = choice0.get("text")
-            if text:
-                return text
-        # fallback: return whole JSON as string
-        return json.dumps(j)
+        return getattr(resp, "text", "") or ""
     except Exception:
-        return json.dumps(j)
+        return ""
 
 
-def analyze_service_single(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> dict:
-    """
-    Extract service-mode fields from a single image.
-    Returns a dict that follows the SERVICE_SCHEMA keys (use null/None for missing).
-    Also includes 'raw_text' with the full assistant text or OCR provenance when available.
-    """
+def analyze_service_single(token: str, image_path: str, model_name: str,
+                           log_placeholder, logs: list) -> dict:
+
     image_name = Path(image_path).name
-    sector = Path(image_path).stem.split("_")[0]
-    log_append(log_placeholder, logs, f"[LOG] Starting single-image service extraction for '{image_name}' using {model_name}")
+
+    log_append(
+        log_placeholder,
+        logs,
+        f"[LOG] Service single-image extraction '{image_name}'"
+    )
+
     try:
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
     except Exception as e:
-        log_append(log_placeholder, logs, f"[ERROR] Could not read image '{image_name}': {e}")
+        log_append(log_placeholder, logs, f"[ERROR] Read failed: {e}")
         return {}
 
-    # Tight per-image prompt: schema will be injected as JSON by the caller environment
     prompt = (
         "You are a precise telecom data extractor. The user uploaded a ServiceMode screenshot (single image). "
         "Task: extract values and return EXACTLY one JSON object matching the SCHEMA below. "
@@ -578,45 +655,62 @@ def analyze_service_single(token: str, image_path: str, model_name: str, log_pla
 
     payload = {
         "model": model_name,
-        "messages": [
-            {"role": "user", "content": [
+        "messages": [{
+            "role": "user",
+            "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-            ]}
-        ],
-        "response_format": {"type": "json_object"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{b64}"
+                    }
+                }
+            ]
+        }],
+        "response_format": {"type": "json_object"}
     }
 
+    resp = safe_post_chat_completion(
+        token,
+        payload,
+        timeout=90,
+        retries=3,
+        log_placeholder=log_placeholder,
+        logs=logs
+    )
+
+    if resp is None:
+        log_append(log_placeholder, logs, "[ERROR] Service API failed after retries")
+        return {}
+
     try:
-        resp = _post_chat_completion(token, payload, timeout=90)
         resp.raise_for_status()
-        content = _extract_response_content(resp, log_placeholder, logs)
-        content = clean_json_response(content)
-        try:
-            result = json.loads(content) if isinstance(content, str) else content
-            # Ensure schema keys exist even if missing
-            out = {}
-            for k in SERVICE_SCHEMA.keys():
-                out[k] = result.get(k) if isinstance(result, dict) and k in result else None
-            # carry misc and raw_text if present
-            if isinstance(result, dict):
-                out["misc"] = result.get("misc", {})
-                # if assistant provided raw_text, accept; otherwise fallback to content text
-                out["raw_text"] = result.get("raw_text", content)
-            else:
-                out["misc"] = {}
-                out["raw_text"] = content
-            log_append(log_placeholder, logs, f"[SUCCESS] Single-image service processed '{image_name}'.")
-            return out
-        except Exception as e:
-            log_append(log_placeholder, logs, f"[ERROR] JSON parse failed for single-image '{image_name}': {e}")
-            log_append(log_placeholder, logs, f"  Raw: {getattr(resp, 'text', '')[:2000]}")
-            return {"misc": {}, "raw_text": getattr(resp, "text", "")}
     except Exception as e:
-        log_append(log_placeholder, logs, f"[ERROR] API call failed for single-image '{image_name}': {e}")
-        if 'resp' in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')[:1000]}")
-        return {"misc": {}, "raw_text": ""}
+        log_append(log_placeholder, logs, f"[ERROR] HTTP error: {e}")
+        return {}
+
+    content = _extract_response_content(resp, log_placeholder, logs)
+    content = clean_json_response(content)
+
+    try:
+        result = json.loads(content)
+
+        out = {}
+        for k in SERVICE_SCHEMA.keys():
+            out[k] = result.get(k)
+
+        out["misc"] = result.get("misc", {})
+        out["raw_text"] = result.get("raw_text", content)
+
+        log_append(log_placeholder, logs, f"[SUCCESS] Service '{image_name}' processed")
+
+        return out
+
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[ERROR] JSON parse failed: {e}")
+        log_append(log_placeholder, logs, f"Raw: {content[:1000]}")
+        return {}
+
 
 
 def _normalize_num(v):
@@ -809,97 +903,153 @@ def process_service_images(token: str, image1_path: str, image2_path: str, model
 
 
 
-def analyze_generic_image(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> dict:
+def analyze_generic_image(token: str, image_path: str, model_name: str,
+                          log_placeholder, logs: list) -> dict:
+
     image_name = Path(image_path).name
-    log_append(log_placeholder, logs, f"[LOG] Starting generic extraction for '{image_name}' using {model_name}")
+
+    log_append(
+        log_placeholder,
+        logs,
+        f"[LOG] Starting generic extraction for '{image_name}' using {model_name}"
+    )
+
     try:
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
     except Exception as e:
-        log_append(log_placeholder, logs, f"[ERROR] Could not read image '{image_name}': {e}")
+        log_append(log_placeholder, logs, f"[ERROR] Cannot read image: {e}")
         return {}
 
     prompt = (
-        "You are an expert for cellular test screenshots. Classify the image as 'speed_test', 'video_test', or 'voice_call' "
-        "and return EXACTLY one JSON object matching one of the schemas below. Use null for missing fields. Return only JSON.\n\n"
-        f"SCHEMAS:\n{json.dumps(GENERIC_SCHEMAS, indent=2)}\n"
+        "You are an expert for cellular test screenshots.\n"
+        "Classify image as speed_test, video_test, or voice_call.\n"
+        "Return ONLY valid JSON.\n\n"
+        f"SCHEMAS:\n{json.dumps(GENERIC_SCHEMAS, indent=2)}"
     )
 
     payload = {
         "model": model_name,
-        "messages": [
-            {"role": "user", "content": [
+        "messages": [{
+            "role": "user",
+            "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-            ]}
-        ],
-        "response_format": {"type": "json_object"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{b64}"
+                    }
+                }
+            ]
+        }],
+        "response_format": {"type": "json_object"}
     }
 
+    resp = safe_post_chat_completion(
+        token,
+        payload,
+        timeout=60,
+        retries=3,
+        log_placeholder=log_placeholder,
+        logs=logs
+    )
+
+    if resp is None:
+        log_append(log_placeholder, logs, "[ERROR] Generic API failed after retries")
+        return {}
+
     try:
-        resp = _post_chat_completion(token, payload, timeout=60)
         resp.raise_for_status()
-        content = _extract_response_content(resp, log_placeholder, logs)
-        content = clean_json_response(content)
-        try:
-            result = json.loads(content) if isinstance(content, str) else content
-            log_append(log_placeholder, logs, f"[SUCCESS] AI processed '{image_name}' as '{result.get('image_type', 'unknown')}'.")
-            return result
-        except Exception as e:
-            log_append(log_placeholder, logs, f"[ERROR] JSON parse failed for '{image_name}': {e}")
-            log_append(log_placeholder, logs, f"  Raw resp: {getattr(resp, 'text', '')[:2000]}")
-            return {}
     except Exception as e:
-        log_append(log_placeholder, logs, f"[ERROR] API call failed for '{image_name}': {e}")
-        if 'resp' in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')[:1000]}")
+        log_append(log_placeholder, logs, f"[ERROR] HTTP error: {e}")
+        log_append(log_placeholder, logs, f"Raw: {getattr(resp,'text','')[:1000]}")
+        return {}
+
+    content = _extract_response_content(resp, log_placeholder, logs)
+    content = clean_json_response(content)
+
+    try:
+        result = json.loads(content)
+        log_append(log_placeholder, logs, f"[SUCCESS] Generic processed '{image_name}'")
+        return result
+
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[ERROR] JSON parse failed: {e}")
+        log_append(log_placeholder, logs, f"Raw: {content[:1000]}")
         return {}
 
 
-def analyze_voice_image(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> dict:
+def analyze_voice_image(token: str, image_path: str, model_name: str,
+                        log_placeholder, logs: list) -> dict:
+
     image_name = Path(image_path).name
-    log_append(log_placeholder, logs, f"[VOICE] Starting voice extraction for '{image_name}'")
+
+    log_append(
+        log_placeholder,
+        logs,
+        f"[VOICE] Starting voice extraction for '{image_name}'"
+    )
+
     try:
         with open(image_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
     except Exception as e:
-        log_append(log_placeholder, logs, f"[VOICE ERROR] Could not read/encode: {e}")
+        log_append(log_placeholder, logs, f"[VOICE ERROR] Read failed: {e}")
         return {}
 
     prompt = (
-        "You are a telecom voice-call screenshot extractor. Extract ONLY the fields in the voice_call schema "
-        "and return EXACTLY one JSON object. Use null for missing values. Return only the JSON.\n\n"
-        f"SCHEMA:\n{json.dumps(GENERIC_SCHEMAS['voice_call'], indent=2)}\n"
+        "Extract voice call info.\n"
+        "Return ONLY JSON matching schema.\n\n"
+        f"SCHEMA:\n{json.dumps(GENERIC_SCHEMAS['voice_call'], indent=2)}"
     )
 
     payload = {
         "model": model_name,
-        "messages": [
-            {"role": "user", "content": [
+        "messages": [{
+            "role": "user",
+            "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-            ]}
-        ],
-        "response_format": {"type": "json_object"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{b64}"
+                    }
+                }
+            ]
+        }],
+        "response_format": {"type": "json_object"}
     }
 
+    resp = safe_post_chat_completion(
+        token,
+        payload,
+        timeout=60,
+        retries=3,
+        log_placeholder=log_placeholder,
+        logs=logs
+    )
+
+    if resp is None:
+        log_append(log_placeholder, logs, "[VOICE ERROR] API failed after retries")
+        return {}
+
     try:
-        resp = _post_chat_completion(token, payload, timeout=60)
         resp.raise_for_status()
-        content = _extract_response_content(resp, log_placeholder, logs)
-        content = clean_json_response(content)
-        try:
-            res = json.loads(content) if isinstance(content, str) else content
-            log_append(log_placeholder, logs, f"[VOICE SUCCESS] Processed '{image_name}'.")
-            return res
-        except Exception as e:
-            log_append(log_placeholder, logs, f"[VOICE ERROR] JSON parse failed for '{image_name}': {e}")
-            log_append(log_placeholder, logs, f"  Raw resp: {getattr(resp, 'text', '')[:2000]}")
-            return {}
     except Exception as e:
-        log_append(log_placeholder, logs, f"[VOICE ERROR] API call failed for '{image_name}': {e}")
-        if 'resp' in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')[:1000]}")
+        log_append(log_placeholder, logs, f"[VOICE ERROR] HTTP error: {e}")
+        return {}
+
+    content = _extract_response_content(resp, log_placeholder, logs)
+    content = clean_json_response(content)
+
+    try:
+        res = json.loads(content)
+        log_append(log_placeholder, logs, f"[VOICE SUCCESS] '{image_name}' processed")
+        return res
+
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[VOICE ERROR] JSON parse failed: {e}")
+        log_append(log_placeholder, logs, f"Raw: {content[:1000]}")
         return {}
 
 
