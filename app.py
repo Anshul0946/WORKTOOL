@@ -828,47 +828,97 @@ def evaluate_voice_image(token: str, image_path: str, model_name: str, log_place
 
 # ---------------- Careful evaluation functions ----------------
 def evaluate_service_images(token: str, image1_path: str, image2_path: str, model_name: str, log_placeholder, logs: list) -> Optional[dict]:
+    """
+    Careful evaluation that no longer sends two images in one request.
+    Instead:
+      1) Analyze each service image separately (analyze_service_single)
+      2) If deterministic merging still has unresolved fields, send TEXT-ONLY reconciliation prompt
+         (SCHEMA + res1 + res2) to the model and parse JSON response.
+    Returns reconciled dict or None.
+    """
     sector = Path(image1_path).stem.split("_")[0] if image1_path else "unknown"
-    log_append(log_placeholder, logs, f"[EVAL] Re-evaluating service images for '{sector}' (careful)")
+    log_append(log_placeholder, logs, f"[EVAL] Re-evaluating service images for '{sector}' (careful, text-only reconciliation)")
+
+    # 1) Extract per-image JSONs using existing analyzer (single-image vision calls)
     try:
-        with open(image1_path, "rb") as f:
-            b1 = base64.b64encode(f.read()).decode("utf-8")
-        with open(image2_path, "rb") as f:
-            b2 = base64.b64encode(f.read()).decode("utf-8")
+        res1 = analyze_service_single(token, image1_path, model_name, log_placeholder, logs) if image1_path else {}
+        res2 = analyze_service_single(token, image2_path, model_name, log_placeholder, logs) if image2_path else {}
     except Exception as e:
-        log_append(log_placeholder, logs, f"[EVAL ERROR] Could not read/encode images: {e}")
+        log_append(log_placeholder, logs, f"[EVAL ERROR] Failed per-image analysis: {e}")
         return None
 
-    prompt = (
-        "CAREFUL EVALUATION: Examine both images line-by-line and extract values matching the schema. "
-        "Return a single JSON object. Use null only if field truly not present.\n\n"
-        f"SCHEMA:\n{json.dumps(SERVICE_SCHEMA, indent=2)}"
+    if not isinstance(res1, dict):
+        res1 = {}
+    if not isinstance(res2, dict):
+        res2 = {}
+
+    # quick sanity: if both are empty, nothing to do
+    if not res1 and not res2:
+        log_append(log_placeholder, logs, "[EVAL] Both per-image analyses returned empty. Skipping reconciliation.")
+        return None
+
+    # 2) Attempt deterministic merge first (reuse existing logic)
+    merged_det = merge_service_responses(token, res1, res2, SERVICE_SCHEMA, model_name, log_placeholder, logs)
+    # If deterministic merge succeeded without unresolved conflicts, return it
+    # merge_service_responses sets _meta/_provenance and logs accordingly
+    unresolved_flag = False
+    try:
+        meta_decisions = merged_det.get("_meta", {}).get("decisions", {})
+        # if any decision has reason indicating conflict or chosen None when both v1 and v2 present -> unresolved
+        for k, d in (meta_decisions.items() if isinstance(meta_decisions, dict) else []):
+            reason = d.get("reason")
+            chosen = d.get("chosen")
+            v1 = d.get("v1")
+            v2 = d.get("v2")
+            if reason in ("conflict_ids", "bw_large_diff_conflict") or (chosen is None and (v1 is not None and v2 is not None)):
+                unresolved_flag = True
+                break
+    except Exception:
+        unresolved_flag = True
+
+    if not unresolved_flag:
+        log_append(log_placeholder, logs, "[EVAL] Deterministic merge returned a complete result; returning.")
+        return merged_det
+
+    # 3) Unresolved -> call text-only reconciliation model prompt (no images)
+    log_append(log_placeholder, logs, "[EVAL] Deterministic rules left conflicts — calling text-only model to reconcile JSONs.")
+
+    recon_prompt = (
+        "You are a senior radio network engineer. Reconcile the two extracted JSONs into one authoritative JSON "
+        "that matches the SCHEMA exactly. For each field return the chosen value (or null) and populate a 'meta' object "
+        "containing v1, v2, chosen, reason (short telecom justification), and confidence (0-1). Use deterministic telecom "
+        "logic: RSRP/RSRQ/SINR ranges and preferences, PCI/ARFCN exactness, RAT separation (NR vs LTE). Do not invent values.\n\n"
+        f"SCHEMA:\n{json.dumps(SERVICE_SCHEMA, indent=2)}\n\n"
+        f"RES1:\n{json.dumps(res1, indent=2)}\n\n"
+        f"RES2:\n{json.dumps(res2, indent=2)}\n\n"
+        "Return EXACTLY one JSON object that contains schema fields, 'meta', and keep a '_provenance' block with res1/res2. "
+        "Return no explanation outside the JSON."
     )
 
     payload = {
         "model": model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b1}"}},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b2}"}},
-                ],
-            }
-        ],
+        "messages": [{"role": "user", "content": [{"type": "text", "text": recon_prompt}]}],
         "response_format": {"type": "json_object"},
     }
 
     try:
-        resp = _post_chat_completion(token, payload, timeout=120)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        resp = _post_chat_completion(token, payload, timeout=90)
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            # log response text if available
+            log_append(log_placeholder, logs, f"[EVAL ERROR] Reconciliation call failed: {e}. Response text: {getattr(resp, 'text', '')}")
+            return None
+
+        content = _extract_response_content(resp, log_placeholder, logs)
         content = clean_json_response(content)
-        return json.loads(content)
+        reconciled = json.loads(content)
+        reconciled["_provenance"] = {"res1": res1, "res2": res2}
+        log_append(log_placeholder, logs, "[EVAL] Model reconciliation successful.")
+        return reconciled
     except Exception as e:
         log_append(log_placeholder, logs, f"[EVAL ERROR] Service evaluation failed: {e}")
-        if "resp" in locals():
+        if 'resp' in locals():
             log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')}")
         return None
     finally:
