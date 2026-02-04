@@ -23,9 +23,9 @@ import openpyxl
 from PIL import Image
 
 # ---------------- Configuration ----------------
-API_BASE = "https://openrouter.apify.actor/api/v1"
-MODEL_SERVICE_DEFAULT = "x-ai/grok-4.1-fast"
-MODEL_GENERIC_DEFAULT = "x-ai/grok-4.1-fast"
+API_BASE = "https://integrate.api.nvidia.com/v1"
+MODEL_SERVICE_DEFAULT = "meta/llama-3.2-90b-vision-instruct"
+MODEL_GENERIC_DEFAULT = "meta/llama-3.2-90b-vision-instruct"
 
 # ---------------- Schemas ----------------
 SERVICE_SCHEMA = {
