@@ -903,16 +903,17 @@ def process_service_images(token: str, image1_path: str, image2_path: str, model
 
 
 
-def analyze_generic_image(token: str, image_path: str, model_name: str,
-                          log_placeholder, logs: list) -> dict:
-
+def analyze_generic_image(token: str,
+                          image_path: str,
+                          model_name: str,
+                          log_placeholder,
+                          logs: list) -> dict:
+    """
+    Production analyze path for a single generic image.
+    Classifies to speed_test/video_test/voice_call and returns the model result as dict (or {}).
+    """
     image_name = Path(image_path).name
-
-    log_append(
-        log_placeholder,
-        logs,
-        f"[LOG] Starting generic extraction for '{image_name}' using {model_name}"
-    )
+    log_append(log_placeholder, logs, f"[LOG] Starting generic extraction for '{image_name}'")
 
     try:
         with open(image_path, "rb") as f:
@@ -934,26 +935,13 @@ def analyze_generic_image(token: str, image_path: str, model_name: str,
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{b64}"
-                    }
-                }
-            ]
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}} ,
+            ],
         }],
         "response_format": {"type": "json_object"}
     }
 
-    resp = safe_post_chat_completion(
-        token,
-        payload,
-        timeout=60,
-        retries=3,
-        log_placeholder=log_placeholder,
-        logs=logs
-    )
-
+    resp = safe_post_chat_completion(token, payload, timeout=60, retries=3, log_placeholder=log_placeholder, logs=logs)
     if resp is None:
         log_append(log_placeholder, logs, "[ERROR] Generic API failed after retries")
         return {}
@@ -970,25 +958,28 @@ def analyze_generic_image(token: str, image_path: str, model_name: str,
 
     try:
         result = json.loads(content)
-        log_append(log_placeholder, logs, f"[SUCCESS] Generic processed '{image_name}'")
+        log_append(log_placeholder, logs, f"[SUCCESS] Generic processed '{image_name}' as '{result.get('image_type','unknown')}'.")
         return result
-
     except Exception as e:
         log_append(log_placeholder, logs, f"[ERROR] JSON parse failed: {e}")
         log_append(log_placeholder, logs, f"Raw: {content[:1000]}")
         return {}
+    finally:
+        log_append(log_placeholder, logs, "[LOG] Cooldown: waiting 2 seconds")
+        time.sleep(2)
 
 
-def analyze_voice_image(token: str, image_path: str, model_name: str,
-                        log_placeholder, logs: list) -> dict:
-
+def analyze_voice_image(token: str,
+                        image_path: str,
+                        model_name: str,
+                        log_placeholder,
+                        logs: list) -> dict:
+    """
+    Production analyze for voice images. Uses safe_post_chat_completion and robust parsing.
+    Returns {} on failure, or parsed dict on success.
+    """
     image_name = Path(image_path).name
-
-    log_append(
-        log_placeholder,
-        logs,
-        f"[VOICE] Starting voice extraction for '{image_name}'"
-    )
+    log_append(log_placeholder, logs, f"[VOICE] Starting voice extraction for '{image_name}'")
 
     try:
         with open(image_path, "rb") as f:
@@ -998,37 +989,26 @@ def analyze_voice_image(token: str, image_path: str, model_name: str,
         return {}
 
     prompt = (
-        "Extract voice call info.\n"
-        "Return ONLY JSON matching schema.\n\n"
+        "You are an expert in telecom voice-call screenshot extraction. Extract ONLY the fields in the voice_call schema "
+        "and emphasize 'time' (return exactly as seen). Return one JSON object.\n\n"
         f"SCHEMA:\n{json.dumps(GENERIC_SCHEMAS['voice_call'], indent=2)}"
     )
 
     payload = {
         "model": model_name,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{b64}"
-                    }
-                }
-            ]
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                ],
+            }
+        ],
         "response_format": {"type": "json_object"}
     }
 
-    resp = safe_post_chat_completion(
-        token,
-        payload,
-        timeout=60,
-        retries=3,
-        log_placeholder=log_placeholder,
-        logs=logs
-    )
-
+    resp = safe_post_chat_completion(token, payload, timeout=60, retries=3, log_placeholder=log_placeholder, logs=logs)
     if resp is None:
         log_append(log_placeholder, logs, "[VOICE ERROR] API failed after retries")
         return {}
@@ -1037,20 +1017,23 @@ def analyze_voice_image(token: str, image_path: str, model_name: str,
         resp.raise_for_status()
     except Exception as e:
         log_append(log_placeholder, logs, f"[VOICE ERROR] HTTP error: {e}")
+        log_append(log_placeholder, logs, f"  Raw: {getattr(resp, 'text','')[:1000]}")
         return {}
 
     content = _extract_response_content(resp, log_placeholder, logs)
     content = clean_json_response(content)
 
     try:
-        res = json.loads(content)
-        log_append(log_placeholder, logs, f"[VOICE SUCCESS] '{image_name}' processed")
-        return res
-
+        parsed = json.loads(content)
+        log_append(log_placeholder, logs, f"[VOICE SUCCESS] Processed '{image_name}'.")
+        return parsed
     except Exception as e:
         log_append(log_placeholder, logs, f"[VOICE ERROR] JSON parse failed: {e}")
-        log_append(log_placeholder, logs, f"Raw: {content[:1000]}")
+        log_append(log_placeholder, logs, f"  Raw: {content[:1000]}")
         return {}
+    finally:
+        log_append(log_placeholder, logs, "[VOICE] Cooldown: waiting 2 seconds")
+        time.sleep(2)
 
 
 
@@ -1059,44 +1042,99 @@ def evaluate_voice_image(token: str, image_path: str, model_name: str, log_place
     return analyze_voice_image(token, image_path, model_name, log_placeholder, logs)
 
 # ---------------- Careful evaluation functions ----------------
-def evaluate_service_images(token: str, image1_path: str, image2_path: str, model_name: str, log_placeholder, logs: list) -> dict:
-    sector = Path(image1_path).stem.split("_")[0] if image1_path else (Path(image2_path).stem.split("_")[0] if image2_path else 'unknown')
-    log_append(log_placeholder, logs, f"[EVAL] Re-evaluating service images for '{sector}' (careful, patched)")
-    # 1) per-image extract
+def evaluate_service_images(token: str,
+                            image1_path: str,
+                            image2_path: str,
+                            model_name: str,
+                            log_placeholder,
+                            logs: list) -> Optional[dict]:
+    """
+    Careful evaluation that sends BOTH service images together, with robust retry & parsing.
+    Returns parsed dict matching SERVICE_SCHEMA keys (or None on hard failure).
+    """
+    sector = Path(image1_path).stem.split("_")[0] if image1_path else "unknown"
+    log_append(log_placeholder, logs, f"[EVAL] Re-evaluating service images for '{sector}' (careful)")
+
     try:
-        res1 = analyze_service_single(token, image1_path, model_name, log_placeholder, logs) if image1_path else {}
+        with open(image1_path, "rb") as f:
+            b1 = base64.b64encode(f.read()).decode("utf-8")
+        with open(image2_path, "rb") as f:
+            b2 = base64.b64encode(f.read()).decode("utf-8")
     except Exception as e:
-        log_append(log_placeholder, logs, f"[EVAL ERROR] analyze_service_single image1 failed: {e}")
-        res1 = {}
-    try:
-        res2 = analyze_service_single(token, image2_path, model_name, log_placeholder, logs) if image2_path else {}
-    except Exception as e:
-        log_append(log_placeholder, logs, f"[EVAL ERROR] analyze_service_single image2 failed: {e}")
-        res2 = {}
-    res1 = res1 if isinstance(res1, dict) else {}
-    res2 = res2 if isinstance(res2, dict) else {}
-    if not res1 and not res2:
-        log_append(log_placeholder, logs, "[EVAL] Both per-image analyses empty; returning None")
+        log_append(log_placeholder, logs, f"[EVAL ERROR] Could not read/encode images: {e}")
         return None
-    v1 = verify_parsed_json(res1, SERVICE_SCHEMA)
-    v2 = verify_parsed_json(res2, SERVICE_SCHEMA)
-    log_append(log_placeholder, logs, f"[EVAL] image1 verification: ok={v1['ok']} issues={v1['issues']}")
-    log_append(log_placeholder, logs, f"[EVAL] image2 verification: ok={v2['ok']} issues={v2['issues']}")
-    merged = merge_service_responses(token, res1, res2, SERVICE_SCHEMA, model_name, log_placeholder, logs)
-    normalized = normalize_and_validate_service(merged)
-    if '_meta' in merged:
-        low_conf = []
-        for k, d in merged['_meta'].get('decisions', {}).items():
-            conf = d.get('confidence') if isinstance(d, dict) else None
-            if conf is None:
-                if d.get('chosen') is None and (d.get('v1') is not None or d.get('v2') is not None):
-                    low_conf.append(k)
-        if low_conf:
-            log_append(log_placeholder, logs, f"[EVAL] Fields flagged low-confidence: {low_conf}")
-    return normalized
+
+    prompt = (
+        "CAREFUL EVALUATION: Examine both images line-by-line and extract values matching the schema. "
+        "Return a single JSON object. Use null only if field truly not present.\n\n"
+        f"SCHEMA:\n{json.dumps(SERVICE_SCHEMA, indent=2)}"
+    )
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b1}"}},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b2}"}},
+                ],
+            }
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    # Use the safe wrapper with exponential timeout doubling and retries
+    resp = safe_post_chat_completion(token, payload, timeout=60, retries=3, log_placeholder=log_placeholder, logs=logs)
+    if resp is None:
+        log_append(log_placeholder, logs, "[EVAL ERROR] Service evaluation aborted after retries (no response).")
+        return None
+
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[EVAL ERROR] HTTP error from service evaluation: {e}")
+        log_append(log_placeholder, logs, f"  Raw: {getattr(resp, 'text', '')[:1000]}")
+        return None
+
+    content = _extract_response_content(resp, log_placeholder, logs)
+    content = clean_json_response(content)
+
+    try:
+        parsed = json.loads(content)
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[EVAL ERROR] JSON parse failed (service eval): {e}")
+        log_append(log_placeholder, logs, f"  Raw: {content[:1000]}")
+        return None
+
+    # Normalize into the SERVICE_SCHEMA shape (preserve misc/raw_text)
+    out = {}
+    try:
+        for k in SERVICE_SCHEMA.keys():
+            out[k] = parsed.get(k)
+        out["misc"] = parsed.get("misc", {})
+        out["raw_text"] = parsed.get("raw_text", content)
+        log_append(log_placeholder, logs, f"[EVAL] Service careful-eval returned data for '{sector}'")
+        return out
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[EVAL ERROR] Post-process failed: {e}")
+        return None
+    finally:
+        log_append(log_placeholder, logs, "[EVAL] Cooldown: waiting 2 seconds")
+        time.sleep(2)
 
 
-def evaluate_generic_image(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> Optional[dict]:
+
+def evaluate_generic_image(token: str,
+                           image_path: str,
+                           model_name: str,
+                           log_placeholder,
+                           logs: list) -> Optional[dict]:
+    """
+    Careful evaluation for a single generic image (speed/video/voice classification + extraction).
+    Uses safe_post_chat_completion and robust parsing.
+    """
     image_name = Path(image_path).name
     log_append(log_placeholder, logs, f"[EVAL] Re-evaluating '{image_name}' (careful)")
     try:
@@ -1126,16 +1164,28 @@ def evaluate_generic_image(token: str, image_path: str, model_name: str, log_pla
         "response_format": {"type": "json_object"},
     }
 
+    resp = safe_post_chat_completion(token, payload, timeout=60, retries=3, log_placeholder=log_placeholder, logs=logs)
+    if resp is None:
+        log_append(log_placeholder, logs, f"[EVAL ERROR] Generic evaluation aborted after retries for '{image_name}'.")
+        return None
+
     try:
-        resp = _post_chat_completion(token, payload, timeout=90)
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        content = clean_json_response(content)
-        return json.loads(content)
     except Exception as e:
-        log_append(log_placeholder, logs, f"[EVAL ERROR] Generic evaluation failed for '{image_name}': {e}")
-        if "resp" in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')}")
+        log_append(log_placeholder, logs, f"[EVAL ERROR] HTTP error for '{image_name}': {e}")
+        log_append(log_placeholder, logs, f"  Raw: {getattr(resp, 'text', '')[:1000]}")
+        return None
+
+    content = _extract_response_content(resp, log_placeholder, logs)
+    content = clean_json_response(content)
+
+    try:
+        parsed = json.loads(content)
+        log_append(log_placeholder, logs, f"[EVAL] Careful evaluate succeeded for '{image_name}'")
+        return parsed
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[EVAL ERROR] JSON parse failed for '{image_name}': {e}")
+        log_append(log_placeholder, logs, f"  Raw: {content[:1000]}")
         return None
     finally:
         log_append(log_placeholder, logs, "[EVAL] Cooldown: waiting 2 seconds")
@@ -1230,18 +1280,20 @@ def set_nested_value_case_insensitive(target: dict, keys: list, value):
     return True
 
 
-def ask_model_for_expression_value(token: str, var_name: str, var_obj, expression: str, model_name: str, log_placeholder, logs: list):
-    """Ask model to evaluate expression using only provided JSON variable; return value or None."""
-    try:
-        var_json = json.dumps(var_obj, indent=2)
-    except Exception:
-        var_json = json.dumps(str(var_obj))
-
+def ask_model_for_expression_value(token: str,
+                                   expression: str,
+                                   model_name: str,
+                                   log_placeholder,
+                                   logs: list) -> Optional[any]:
+    """
+    Ask the model to resolve a small expression (used by your expression helpers).
+    Returns parsed 'value' field (or None).
+    Safe wrapper + robust extraction (replaces direct _post_chat_completion usage).
+    """
     prompt = (
-        f"You are an exact assistant. You are given a JSON variable named '{var_name}':\n\n"
-        f"{var_json}\n\nGiven the expression:\n{expression}\n\n"
-        "Using ONLY the provided JSON variable, return exactly one JSON object:\n{ \"value\": <value> }\n"
-        "Where <value> is the exact value or null. Return ONLY the JSON object and nothing else."
+        f"Resolve the following expression and return a JSON object: {{\"value\": <result or null>}}\n\n"
+        f"Expression: {expression}\n"
+        "Return only the JSON object."
     )
 
     payload = {
@@ -1250,19 +1302,28 @@ def ask_model_for_expression_value(token: str, var_name: str, var_obj, expressio
         "response_format": {"type": "json_object"},
     }
 
+    resp = safe_post_chat_completion(token, payload, timeout=30, retries=3, log_placeholder=log_placeholder, logs=logs)
+    if resp is None:
+        log_append(log_placeholder, logs, f"[ASK-MODEL] Failed for expr {expression}: no resp after retries")
+        return None
+
     try:
-        resp = _post_chat_completion(token, payload, timeout=30)
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        content = clean_json_response(content)
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[ASK-MODEL] HTTP error for expr {expression}: {e}")
+        log_append(log_placeholder, logs, f"  Raw: {getattr(resp,'text','')[:1000]}")
+        return None
+
+    content = _extract_response_content(resp, log_placeholder, logs)
+    content = clean_json_response(content)
+
+    try:
         parsed = json.loads(content)
         return parsed.get("value", None)
     except Exception as e:
-        log_append(log_placeholder, logs, f"[ASK-MODEL] Failed for expr {expression}: {e}")
-        if "resp" in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')}")
+        log_append(log_placeholder, logs, f"[ASK-MODEL] Parsing failed for expr {expression}: {e}")
+        log_append(log_placeholder, logs, f"  Raw: {content[:1000]}")
         return None
-
 
 # ---------------- Main processing function for Streamlit ----------------
 def process_file_streamlit(user_file_path: str,
