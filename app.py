@@ -338,21 +338,21 @@ def get_sector_from_col(col_index: int) -> str:
 #---------------- new additon ----------------------
 
 def clean_json_response(content: str) -> str:
-    """Remove markdown code blocks from JSON responses."""
+    """
+    Strip markdown fences and whitespace around JSON-ish responses.
+    """
     if not content:
         return content
-    
-    content = content.strip()
-    
-    # Remove markdown code block wrappers
+    content = str(content).strip()
+    # remove ```json or ``` wrappers
     if content.startswith("```"):
-        # Remove opening ```json or ```
-        content = re.sub(r'^```(?:json)?\s*\n?', '', content)
-        # Remove closing ```
-        content = re.sub(r'\n?```\s*$', '', content)
-    
+        content = re.sub(r'^```(?:json)?\s*', '', content)
+        content = re.sub(r'\s*```$', '', content)
+    # sometimes the assistant returns text with leading explanation then JSON block - try to find JSON object
+    m = re.search(r"(\{[\s\S]*\})", content)
+    if m:
+        return m.group(1).strip()
     return content.strip()
-
 
 # ---------------- Image extraction (only .xlsx now) ----------------
 def extract_images_from_excel(xlsx_path: str, output_folder: str, log_placeholder, logs: list) -> List[str]:
@@ -406,90 +406,350 @@ def extract_images_from_excel(xlsx_path: str, output_folder: str, log_placeholde
 
 
 # ---------------- API helpers & analyzers ----------------
-def _post_chat_completion(token: str, payload: dict, timeout: int = 60):
+def _post_chat_completion(token: str, payload: dict, timeout: int = 60, max_retries: int = 3):
+    """
+    Robust POST to the chat completions endpoint with small backoff retries.
+    Returns the requests.Response on success or raises the last exception.
+    Expects _apify_headers(token) to exist in the codebase.
+    """
     headers = _apify_headers(token)
-    return requests.post(url=f"{API_BASE}/chat/completions", headers=headers, data=json.dumps(payload), timeout=timeout)
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url=f"{API_BASE}/chat/completions", headers=headers, json=payload, timeout=timeout)
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            # exponential-ish backoff
+            wait = min(8, (1.5 ** attempt))
+            try:
+                time.sleep(wait)
+            except Exception:
+                pass
+    # re-raise
+    raise last_exc
 
-
-def process_service_images(token: str, image1_path: str, image2_path: str, model_name: str, log_placeholder, logs: list) -> Optional[dict]:
-    sector = Path(image1_path).stem.split("_")[0]
-    log_append(log_placeholder, logs, f"[LOG] Starting service extraction for '{sector}' using {model_name}")
+def _extract_response_content(resp, log_placeholder, logs: list) -> str:
+    """
+    Safely extract the model assistant content from a response.
+    If the HTTP body is JSON with choices -> return choices[0].message.content
+    Otherwise return resp.text as fallback (and log it).
+    """
     try:
-        with open(image1_path, "rb") as f:
-            b1 = base64.b64encode(f.read()).decode("utf-8")
-        with open(image2_path, "rb") as f:
-            b2 = base64.b64encode(f.read()).decode("utf-8")
-    except Exception as e:
-        log_append(log_placeholder, logs, f"[ERROR] Could not read/encode service images: {e}")
-        return None
+        j = resp.json()
+    except Exception:
+        log_append(log_placeholder, logs, f"[DEBUG] Non-JSON response body (first 2000 chars):\n{getattr(resp, 'text', '')[:2000]}")
+        return getattr(resp, 'text', '')
+    # Extract common assistant path
+    try:
+        choices = j.get("choices")
+        if choices and isinstance(choices, list) and len(choices) > 0:
+            choice0 = choices[0]
+            # compatible with several provider shapes
+            message = choice0.get("message") if isinstance(choice0, dict) else None
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, dict):
+                    return json.dumps(content)
+                return content if content is not None else json.dumps(j)
+            # older shape: choice0.get("text")
+            text = choice0.get("text")
+            if text:
+                return text
+        # fallback: return whole JSON as string
+        return json.dumps(j)
+    except Exception:
+        return json.dumps(j)
 
+
+def analyze_service_single(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> dict:
+    """
+    Extract service-mode fields from a single image.
+    Returns a dict that follows the SERVICE_SCHEMA keys (use null/None for missing).
+    Also includes 'raw_text' with the full assistant text or OCR provenance when available.
+    """
+    image_name = Path(image_path).name
+    sector = Path(image_path).stem.split("_")[0]
+    log_append(log_placeholder, logs, f"[LOG] Starting single-image service extraction for '{image_name}' using {model_name}")
+    try:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[ERROR] Could not read image '{image_name}': {e}")
+        return {}
+
+    # Tight per-image prompt: schema will be injected as JSON by the caller environment
     prompt = (
-        "You are a hyper-specialized AI for cellular network engineering data analysis. "
-        "Analyze both provided service-mode screenshots carefully and return exactly one JSON object "
-        "matching the schema. Use null where value is not found.\n\n"
-        f"SCHEMA:\n{json.dumps(SERVICE_SCHEMA, indent=2)}"
+        "You are a precise telecom data extractor. The user uploaded a ServiceMode screenshot (single image). "
+        "Task: extract values and return EXACTLY one JSON object matching the SCHEMA below. "
+        "Use null for missing values. DO NOT return prose; return ONLY the JSON object.\n\n"
+        f"SCHEMA:\n{json.dumps(SERVICE_SCHEMA, indent=2)}\n\n"
+        "Rules:\n"
+        "- Normalize numeric values: remove units (dBm, MHz) and return numbers where possible.\n"
+        "- RSRP/RSRQ/SINR: numbers in dB (e.g. -95, -11, 23.0).\n"
+        "- PCI/ARFCN: integers when parseable.\n"
+        "- Bandwidth (bw): number in MHz.\n"
+        "- If uncertain set field to null.\n"
+        "- Put any raw/unparsed lines into 'misc' as key:value.\n"
+        "- Include 'raw_text' containing the full extracted image text for provenance.\n"
     )
 
     payload = {
         "model": model_name,
         "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b1}"}},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b2}"}},
-                ],
-            }
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+            ]}
         ],
         "response_format": {"type": "json_object"},
     }
 
     try:
-        resp = _post_chat_completion(token, payload, timeout=120)
+        resp = _post_chat_completion(token, payload, timeout=90)
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        content = _extract_response_content(resp, log_placeholder, logs)
         content = clean_json_response(content)
-        result = json.loads(content)
-        log_append(log_placeholder, logs, f"[SUCCESS] AI processed service data for '{sector}'.")
-        return result
+        try:
+            result = json.loads(content) if isinstance(content, str) else content
+            # Ensure schema keys exist even if missing
+            out = {}
+            for k in SERVICE_SCHEMA.keys():
+                out[k] = result.get(k) if isinstance(result, dict) and k in result else None
+            # carry misc and raw_text if present
+            if isinstance(result, dict):
+                out["misc"] = result.get("misc", {})
+                # if assistant provided raw_text, accept; otherwise fallback to content text
+                out["raw_text"] = result.get("raw_text", content)
+            else:
+                out["misc"] = {}
+                out["raw_text"] = content
+            log_append(log_placeholder, logs, f"[SUCCESS] Single-image service processed '{image_name}'.")
+            return out
+        except Exception as e:
+            log_append(log_placeholder, logs, f"[ERROR] JSON parse failed for single-image '{image_name}': {e}")
+            log_append(log_placeholder, logs, f"  Raw: {getattr(resp, 'text', '')[:2000]}")
+            return {"misc": {}, "raw_text": getattr(resp, "text", "")}
     except Exception as e:
-        log_append(log_placeholder, logs, f"[ERROR] API call failed for service images: {e}")
-        if "resp" in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')}")
+        log_append(log_placeholder, logs, f"[ERROR] API call failed for single-image '{image_name}': {e}")
+        if 'resp' in locals():
+            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')[:1000]}")
+        return {"misc": {}, "raw_text": ""}
+
+
+def _normalize_num(v):
+    if v is None:
         return None
-    finally:
-        log_append(log_placeholder, logs, "[LOG] Cooldown: waiting 2 seconds")
-        time.sleep(2)
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().lower()
+    s = s.replace(',', '')
+    # keep minus and dot and digits
+    s = re.sub(r'[^\d\.\-]', '', s)
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _is_plausible_rsrp(n):
+    try:
+        return -140 <= n <= -40
+    except Exception:
+        return False
+
+def deterministic_merge_for_key(k, v1, v2):
+    # Handle trivial cases
+    if v1 is None and v2 is None:
+        return None, "both_null"
+    if v1 is None:
+        return v2, "take_v2"
+    if v2 is None:
+        return v1, "take_v1"
+    # identical
+    if str(v1).strip() == str(v2).strip():
+        return v1, "equal"
+    # numeric RSRP / RSRQ / SINR handling
+    if k in ("nr5g_rsrp", "lte_rsrp"):
+        n1 = _normalize_num(v1)
+        n2 = _normalize_num(v2)
+        if n1 is None and n2 is not None:
+            return v2, "v1_bad"
+        if n2 is None and n1 is not None:
+            return v1, "v2_bad"
+        if n1 is not None and n2 is not None:
+            # prefer less-negative (higher) value
+            if _is_plausible_rsrp(n1) and _is_plausible_rsrp(n2):
+                chosen = v1 if n1 > n2 else v2
+                return chosen, "higher_rsrp_preferred"
+            # if only one plausible, choose it
+            if _is_plausible_rsrp(n1) and not _is_plausible_rsrp(n2):
+                return v1, "v2_implausible"
+            if _is_plausible_rsrp(n2) and not _is_plausible_rsrp(n1):
+                return v2, "v1_implausible"
+        return v1, "fallback_numeric"
+    if k in ("nr5g_rsrq", "lte_rsrq"):
+        n1 = _normalize_num(v1); n2 = _normalize_num(v2)
+        if n1 is None and n2 is not None: return v2, "v1_bad"
+        if n2 is None and n1 is not None: return v1, "v2_bad"
+        if n1 is not None and n2 is not None:
+            return (v1 if n1 > n2 else v2), "higher_rsrq_preferred"
+    if k in ("nr5g_sinr", "lte_sinr"):
+        n1 = _normalize_num(v1); n2 = _normalize_num(v2)
+        if n1 is None and n2 is not None: return v2, "v1_bad"
+        if n2 is None and n1 is not None: return v1, "v2_bad"
+        if n1 is not None and n2 is not None:
+            return (v1 if n1 > n2 else v2), "higher_sinr_preferred"
+    # identifiers (PCI/ARFCN) - be conservative
+    if k in ("nr_pci", "lte_pci", "nr_arfcn", "lte_earfcn"):
+        try:
+            s1 = str(v1).strip()
+            s2 = str(v2).strip()
+            if s1.isdigit() and not s2.isdigit():
+                return v1, "v2_non_numeric"
+            if s2.isdigit() and not s1.isdigit():
+                return v2, "v1_non_numeric"
+            if s1.isdigit() and s2.isdigit() and s1 != s2:
+                return None, "conflict_ids"
+            # fallback: prefer v1
+            return v1, "prefer_v1_fallback"
+        except Exception:
+            return v1, "prefer_v1_fallback"
+    # bandwidth keys - simple numeric parse
+    if k in ("nr_bw", "lte_bw"):
+        n1 = _normalize_num(v1); n2 = _normalize_num(v2)
+        if n1 is None and n2 is not None: return v2, "v1_bad"
+        if n2 is None and n1 is not None: return v1, "v2_bad"
+        if n1 is not None and n2 is not None:
+            # if difference small prefer larger; if big, unresolved
+            try:
+                if abs(n1 - n2) / max(n1, n2) < 0.25:
+                    return (v1 if n1 >= n2 else v2), "similar_bw_prefer_larger"
+                else:
+                    return None, "bw_large_diff_conflict"
+            except Exception:
+                return v1, "fallback_bw"
+    # default fallback: prefer v1 but mark reason
+    return v1, "prefer_v1_fallback"
 
 
-def analyze_generic_image(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> Optional[dict]:
+ # ----------------- merge orchestration -----------------
+def merge_service_responses(token: str, res1: dict, res2: dict, schema: dict,
+                            model_name: str, log_placeholder, logs: list) -> dict:
+    """
+    Deterministic-first merge of two service JSONs. If unresolved conflicts remain,
+    perform a text-only model reconciliation (no images) that returns a final JSON
+    plus per-field 'meta'. Always attach '_provenance' with original res1/res2.
+    """
+    merged = {}
+    meta = {"decisions": {}}
+    unresolved = False
+
+    for k in schema.keys():
+        v1 = res1.get(k) if isinstance(res1, dict) else None
+        v2 = res2.get(k) if isinstance(res2, dict) else None
+        chosen, reason = deterministic_merge_for_key(k, v1, v2)
+        merged[k] = chosen
+        meta["decisions"][k] = {"v1": v1, "v2": v2, "chosen": chosen, "reason": reason}
+        if reason in ("conflict_ids", "bw_large_diff_conflict") or (chosen is None and (v1 is not None and v2 is not None)):
+            unresolved = True
+
+    merged["misc"] = {}
+    # merge misc gently: keep keys from both
+    if isinstance(res1, dict) and "misc" in res1 and isinstance(res1["misc"], dict):
+        merged["misc"].update(res1["misc"])
+    if isinstance(res2, dict) and "misc" in res2 and isinstance(res2["misc"], dict):
+        merged["misc"].update({k: v for k, v in res2["misc"].items() if k not in merged["misc"]})
+
+    merged["_meta"] = meta
+    merged["_provenance"] = {"res1": res1, "res2": res2}
+
+    if not unresolved:
+        log_append(log_placeholder, logs, "[MERGE] Deterministic merge completed without unresolved conflicts.")
+        return merged
+
+    # unresolved -> fallback to model reconciliation (text-only)
+    log_append(log_placeholder, logs, "[MERGE] Deterministic rules left conflicts — calling model to reconcile.")
+    recon_prompt = (
+        "You are a senior radio network engineer. Reconcile the two extracted JSONs into one authoritative JSON "
+        "that matches the SCHEMA exactly. For each field return the chosen value (or null) and populate a 'meta' object "
+        "containing v1, v2, chosen, reason (short telecom justification), and confidence (0-1). Use deterministic telecom "
+        "logic: RSRP/RSRQ/SINR ranges and preferences, PCI/ARFCN exactness, RAT separation (NR vs LTE). Do not invent values.\n\n"
+        f"SCHEMA:\n{json.dumps(schema, indent=2)}\n\n"
+        f"RES1:\n{json.dumps(res1, indent=2)}\n\n"
+        f"RES2:\n{json.dumps(res2, indent=2)}\n\n"
+        "Return EXACTLY one JSON object that contains schema fields, 'meta', and keep a '_provenance' block with res1/res2. "
+        "Return no explanation outside the JSON."
+    )
+
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": recon_prompt}]}],
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        resp = _post_chat_completion(token, payload, timeout=90)
+        resp.raise_for_status()
+        content = _extract_response_content(resp, log_placeholder, logs)
+        content = clean_json_response(content)
+        try:
+            reconciled = json.loads(content)
+            # ensure provenance present
+            reconciled["_provenance"] = {"res1": res1, "res2": res2}
+            log_append(log_placeholder, logs, "[MERGE] Model reconciliation successful.")
+            return reconciled
+        except Exception as e:
+            log_append(log_placeholder, logs, f"[MERGE] Model response parse failed: {e}")
+            merged["_merge_fallback_reason"] = "model_parse_failed"
+            return merged
+    except Exception as e:
+        log_append(log_placeholder, logs, f"[MERGE] Model fallback failed: {e}. Returning deterministic result with meta.")
+        merged["_merge_fallback_reason"] = "model_call_failed"
+        return merged
+
+       
+def process_service_images(token: str, image1_path: str, image2_path: str, model_name: str, log_placeholder, logs: list) -> dict:
+    """
+    Single-entry function to process a pair of service images:
+      1) Extract per-image JSONs
+      2) Merge deterministically and fallback to model reconciliation if needed
+    Returns the merged service dict (with _meta and _provenance).
+    """
+    sector = Path(image1_path).stem.split("_")[0] if image1_path else "unknown"
+    log_append(log_placeholder, logs, f"[LOG] Starting service extraction for '{sector}' using {model_name} (single-image then merge)")
+
+    res1 = analyze_service_single(token, image1_path, model_name, log_placeholder, logs) if image1_path else {}
+    res2 = analyze_service_single(token, image2_path, model_name, log_placeholder, logs) if image2_path else {}
+
+    merged = merge_service_responses(token, res1, res2, SERVICE_SCHEMA, model_name, log_placeholder, logs)
+    log_append(log_placeholder, logs, f"[SUCCESS] Merged service data for '{sector}'.")
+    return merged
+
+
+
+def analyze_generic_image(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> dict:
     image_name = Path(image_path).name
     log_append(log_placeholder, logs, f"[LOG] Starting generic extraction for '{image_name}' using {model_name}")
     try:
         with open(image_path, "rb") as f:
-            b = base64.b64encode(f.read()).decode("utf-8")
+            b64 = base64.b64encode(f.read()).decode("utf-8")
     except Exception as e:
-        log_append(log_placeholder, logs, f"[ERROR] Could not read/encode image '{image_name}': {e}")
-        return None
+        log_append(log_placeholder, logs, f"[ERROR] Could not read image '{image_name}': {e}")
+        return {}
 
     prompt = (
-        "You are an expert AI assistant for analyzing cellular network test data. "
-        "Classify the image as 'speed_test', 'video_test', or 'voice_call' and return a single JSON object "
-        "matching the corresponding schema. Use null for missing fields.\n\n"
-        f"SCHEMAS:\n{json.dumps(GENERIC_SCHEMAS, indent=2)}"
+        "You are an expert for cellular test screenshots. Classify the image as 'speed_test', 'video_test', or 'voice_call' "
+        "and return EXACTLY one JSON object matching one of the schemas below. Use null for missing fields. Return only JSON.\n\n"
+        f"SCHEMAS:\n{json.dumps(GENERIC_SCHEMAS, indent=2)}\n"
     )
 
     payload = {
         "model": model_name,
         "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}},
-                ],
-            }
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+            ]}
         ],
         "response_format": {"type": "json_object"},
     }
@@ -497,47 +757,46 @@ def analyze_generic_image(token: str, image_path: str, model_name: str, log_plac
     try:
         resp = _post_chat_completion(token, payload, timeout=60)
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        content = _extract_response_content(resp, log_placeholder, logs)
         content = clean_json_response(content)
-        result = json.loads(content)
-        log_append(log_placeholder, logs, f"[SUCCESS] AI processed '{image_name}' as '{result.get('image_type', 'unknown')}'.")
-        return result
+        try:
+            result = json.loads(content) if isinstance(content, str) else content
+            log_append(log_placeholder, logs, f"[SUCCESS] AI processed '{image_name}' as '{result.get('image_type', 'unknown')}'.")
+            return result
+        except Exception as e:
+            log_append(log_placeholder, logs, f"[ERROR] JSON parse failed for '{image_name}': {e}")
+            log_append(log_placeholder, logs, f"  Raw resp: {getattr(resp, 'text', '')[:2000]}")
+            return {}
     except Exception as e:
         log_append(log_placeholder, logs, f"[ERROR] API call failed for '{image_name}': {e}")
-        if "resp" in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')}")
-        return None
-    finally:
-        log_append(log_placeholder, logs, "[LOG] Cooldown: waiting 2 seconds")
-        time.sleep(2)
+        if 'resp' in locals():
+            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')[:1000]}")
+        return {}
 
 
-def analyze_voice_image(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> Optional[dict]:
+def analyze_voice_image(token: str, image_path: str, model_name: str, log_placeholder, logs: list) -> dict:
     image_name = Path(image_path).name
     log_append(log_placeholder, logs, f"[VOICE] Starting voice extraction for '{image_name}'")
     try:
         with open(image_path, "rb") as f:
-            b = base64.b64encode(f.read()).decode("utf-8")
+            b64 = base64.b64encode(f.read()).decode("utf-8")
     except Exception as e:
         log_append(log_placeholder, logs, f"[VOICE ERROR] Could not read/encode: {e}")
-        return None
+        return {}
 
     prompt = (
-        "You are an expert in telecom voice-call screenshot extraction. Extract ONLY the fields in the voice_call schema "
-        "and emphasize 'time' (return exactly as seen). Return one JSON object.\n\n"
-        f"SCHEMA:\n{json.dumps(GENERIC_SCHEMAS['voice_call'], indent=2)}"
+        "You are a telecom voice-call screenshot extractor. Extract ONLY the fields in the voice_call schema "
+        "and return EXACTLY one JSON object. Use null for missing values. Return only the JSON.\n\n"
+        f"SCHEMA:\n{json.dumps(GENERIC_SCHEMAS['voice_call'], indent=2)}\n"
     )
 
     payload = {
         "model": model_name,
         "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b}"}},
-                ],
-            }
+            {"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+            ]}
         ],
         "response_format": {"type": "json_object"},
     }
@@ -545,19 +804,21 @@ def analyze_voice_image(token: str, image_path: str, model_name: str, log_placeh
     try:
         resp = _post_chat_completion(token, payload, timeout=60)
         resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        content = _extract_response_content(resp, log_placeholder, logs)
         content = clean_json_response(content)
-        res = json.loads(content)
-        log_append(log_placeholder, logs, f"[VOICE SUCCESS] Processed '{image_name}'.")
-        return res
+        try:
+            res = json.loads(content) if isinstance(content, str) else content
+            log_append(log_placeholder, logs, f"[VOICE SUCCESS] Processed '{image_name}'.")
+            return res
+        except Exception as e:
+            log_append(log_placeholder, logs, f"[VOICE ERROR] JSON parse failed for '{image_name}': {e}")
+            log_append(log_placeholder, logs, f"  Raw resp: {getattr(resp, 'text', '')[:2000]}")
+            return {}
     except Exception as e:
         log_append(log_placeholder, logs, f"[VOICE ERROR] API call failed for '{image_name}': {e}")
-        if "resp" in locals():
-            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')}")
-        return None
-    finally:
-        log_append(log_placeholder, logs, "[VOICE] Cooldown: waiting 2 seconds")
-        time.sleep(2)
+        if 'resp' in locals():
+            log_append(log_placeholder, logs, f"  Response: {getattr(resp, 'text', '')[:1000]}")
+        return {}
 
 
 
